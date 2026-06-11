@@ -18,6 +18,122 @@ from mistralai.client import Mistral
 
 from curriculum_analyzer import load_curriculum_framework, get_next_sequence_number
 
+# ─── IMAGE EXTRACTION & GOOGLE DRIVE HELPERS ──────────────────────────────────
+DRIVE_URL_PATTERN = re.compile(
+    r'https?://(?:drive|docs)\.google\.com/[^\s\'"<>]+'
+)
+
+def download_google_drive_file(url):
+    import requests
+    # Extract file ID from URL
+    file_id = None
+    
+    # Pattern 1: /file/d/FILE_ID/view
+    m = re.search(r'/file/d/([a-zA-Z0-9_-]+)', url)
+    if m:
+        file_id = m.group(1)
+    else:
+        # Pattern 2: id=FILE_ID
+        m = re.search(r'[?&]id=([a-zA-Z0-9_-]+)', url)
+        if m:
+            file_id = m.group(1)
+            
+    if not file_id:
+        return None
+        
+    download_url = "https://docs.google.com/uc?export=download"
+    session = requests.Session()
+    
+    try:
+        response = session.get(download_url, params={'id': file_id}, stream=True, timeout=15)
+        # Check for confirmation page for large files
+        token = None
+        for key, value in response.cookies.items():
+            if key.startswith('download_warning'):
+                token = value
+                break
+                
+        if token:
+            response = session.get(download_url, params={'id': file_id, 'confirm': token}, stream=True, timeout=15)
+            
+        if response.status_code == 200:
+            return response.content
+    except Exception as e:
+        print(f"Error downloading Google Drive file {url}: {e}")
+        
+    return None
+
+def clean_extracted_url(url):
+    # Strip common punctuation that might be appended to the URL by regex
+    while url and url[-1] in '.,;:?!':
+        url = url[:-1]
+    
+    # Strip closing brackets/parentheses if they are not balanced in the URL
+    while url and url.endswith(')') and url.count('(') < url.count(')'):
+        url = url[:-1]
+    while url and url.endswith(']') and url.count('[') < url.count(']'):
+        url = url[:-1]
+    while url and url.endswith('}') and url.count('{') < url.count('}'):
+        url = url[:-1]
+        
+    return url
+
+def extract_and_download_drive_images(text):
+    if not text or not isinstance(text, str):
+        return [], text
+        
+    urls = DRIVE_URL_PATTERN.findall(text)
+    images = []
+    cleaned_text = text
+    
+    for url in urls:
+        cleaned_url = clean_extracted_url(url)
+        img_bytes = download_google_drive_file(cleaned_url)
+        if img_bytes:
+            images.append(img_bytes)
+            # Remove cleaned_url from the text and clean trailing/leading spaces or punctuation
+            cleaned_text = cleaned_text.replace(cleaned_url, "").strip() if cleaned_url == url else cleaned_text.replace(cleaned_url, "").strip()
+            
+    # Clean up empty parentheses or brackets that might contain URLs, e.g. "()", "[]"
+    cleaned_text = re.sub(r'\(\s*\)', '', cleaned_text)
+    cleaned_text = re.sub(r'\[\s*\]', '', cleaned_text)
+    cleaned_text = re.sub(r'\{\s*\}', '', cleaned_text)
+    cleaned_text = cleaned_text.strip()
+    
+    return images, cleaned_text
+
+def get_images_for_cell(sheet, row_idx, col_idx):
+    """
+    Returns a list of image bytes for images anchored in the cell at (row_idx, col_idx).
+    row_idx and col_idx are 1-based (Excel style).
+    """
+    found_images = []
+    if not hasattr(sheet, '_images'):
+        return found_images
+        
+    for img in sheet._images:
+        anchor = img.anchor
+        img_row, img_col = None, None
+        
+        if hasattr(anchor, '_from'):
+            img_row = anchor._from.row + 1
+            img_col = anchor._from.col + 1
+        elif isinstance(anchor, str):
+            from openpyxl.utils import coordinate_to_tuple
+            try:
+                img_row, img_col = coordinate_to_tuple(anchor)
+            except Exception:
+                pass
+                
+        if img_row == row_idx and img_col == col_idx:
+            try:
+                data = img._data()
+                found_images.append(data)
+            except Exception as e:
+                print(f"Error reading image data at row {row_idx}, col {col_idx}: {e}")
+                
+    return found_images
+
 # ─── MISTRAL CLIENT SETUP ──────────────────────────────────────────────────────
 MODEL = "mistral-large-latest"
 
@@ -266,7 +382,7 @@ def generate_mock_format_fields(row, item_type):
         "equation_format": eq_format
     }
 
-def generate_mock_rationales(row, correct_letter):
+def generate_mock_rationales(row, correct_letter, chapter_name="Science"):
     stem = str(row.get("Item_Stem") or "")
     opts = {
         "A": str(row.get("Option_A") or ""),
@@ -278,13 +394,13 @@ def generate_mock_rationales(row, correct_letter):
     rationales = {}
     for letter, text in opts.items():
         if letter == correct_letter:
-            rationales[f"rationale_{letter.lower()}"] = f"CORRECT ANSWER: {text} is correct because it represents the accurate scientific property of the material."
+            rationales[f"rationale_{letter.lower()}"] = f"CORRECT ANSWER: {text} is correct because it represents the accurate scientific concept for {chapter_name}."
         else:
-            rationales[f"rationale_{letter.lower()}"] = f"Within-category opposite or cross-category confusion: The learner selected '{text}' because they confused this property with another sensory property of materials."
+            rationales[f"rationale_{letter.lower()}"] = f"Misconception or category confusion: The learner selected '{text}' because they confused this concept with another related scientific idea in {chapter_name}."
             
     return rationales
 
-def generate_mock_explanation(row, item_type, correct_letter, rationales):
+def generate_mock_explanation(row, item_type, correct_letter, rationales, chapter_name="Science"):
     stem = str(row.get("Item_Stem") or "")
     opts = {
         "A": str(row.get("Option_A") or ""),
@@ -295,41 +411,43 @@ def generate_mock_explanation(row, item_type, correct_letter, rationales):
     
     if item_type == "MCQ":
         correct_text = opts.get(correct_letter, "")
-        explanation = f"The correct answer is {correct_letter}. {correct_text}.\n\nWhen we test this material, we observe that it matches the properties required by the question stem. Dissolving, transparency, and lustre are distinct categories of material properties.\n\nWhy other options are incorrect:\n\n"
+        explanation = f"The correct answer is {correct_letter}. {correct_text}.\n\nThis is correct because it matches the concepts required by the question stem in the study of {chapter_name}.\n\nWhy other options are incorrect:\n\n"
         for letter in ["A", "B", "C", "D"]:
             if letter != correct_letter:
                 text = opts.get(letter, "")
-                explanation += f"Option {letter} ({text}) is incorrect because it describes a different property of materials that does not solve the task described in the stem.\n\n"
+                explanation += f"Option {letter} ({text}) is incorrect because it describes a different stage, process, or concept that does not solve the task described in the stem.\n\n"
         return explanation.strip()
     else:
         ans = str(row.get("Correct_Answer") or "")
-        return f"The model answer is: {ans}.\n\nThis is correct because the material properties match the requirements of the scenario. Students who answer partially are likely to identify only one relevant property (e.g. strength) while ignoring others (e.g. water resistance)."
+        return f"The model answer is: {ans}.\n\nThis is correct because the concepts match the scientific requirements of the scenario in {chapter_name}. Students who answer partially are likely to identify only one relevant factor while ignoring others."
 
-def generate_mock_rubric(row, max_score):
+def generate_mock_rubric(row, max_score, chapter_name="Science"):
     stem = str(row.get("Item_Stem") or "")
     ans = str(row.get("Correct_Answer") or "")
+    
+    sample_ans = ans if ans else "The correct explanation based on the scientific concepts."
     
     rows = []
     if max_score == 2:
         rows = [
-            {"score": 2, "label": "Full marks", "criteria": "Student correctly identifies both material properties and explains their relevance.", "sample": "This material is suitable because it is both strong and waterproof."},
-            {"score": 1, "label": "Partial marks", "criteria": "Student identifies only one property or fails to explain relevance.", "sample": "It is suitable because it is strong."},
-            {"score": 0, "label": "Zero", "criteria": "Student gives an incorrect or off-topic explanation.", "sample": "It is suitable because it looks nice."}
+            {"score": 2, "label": "Full marks", "criteria": f"Student correctly explains both key scientific aspects related to {chapter_name}.", "sample": sample_ans},
+            {"score": 1, "label": "Partial marks", "criteria": "Student explains only one scientific aspect or fails to provide full reasoning.", "sample": "Identified the basic idea but missed the detailed scientific reason."},
+            {"score": 0, "label": "Zero", "criteria": "Student gives an incorrect, off-topic, or misconception-based response.", "sample": "Gave an explanation that is not scientifically relevant."}
         ]
     elif max_score == 3:
         rows = [
-            {"score": 3, "label": "Full marks", "criteria": "Student applies the concept to the scenario with a fully justified explanation and correct terminology.", "sample": "The bag broke because dried leaves lack tensile strength and are not water-resistant, making them unsuitable for wet grocery items."},
-            {"score": 2, "label": "Substantial", "criteria": "Student provides the correct outcome with mostly complete reasoning.", "sample": "It is flawed because dried leaves tear easily under heavy weight and disintegrate when wet."},
-            {"score": 1, "label": "Basic", "criteria": "Student recognizes the bag failed but cannot describe properties correctly.", "sample": "It is flawed because the watermelon is heavy and leaves are weak."},
-            {"score": 0, "label": "Zero", "criteria": "Student gives a misconception-based answer.", "sample": "It is flawed because watermelons shouldn't be in bags."}
+            {"score": 3, "label": "Full marks", "criteria": f"Student applies concepts to the scenario with a fully justified explanation and correct terminology for {chapter_name}.", "sample": sample_ans},
+            {"score": 2, "label": "Substantial", "criteria": "Student provides the correct outcome with mostly complete reasoning.", "sample": "Gave the correct explanation but with minor terminology gaps."},
+            {"score": 1, "label": "Basic", "criteria": "Student recognizes the basic concept but cannot describe details or reasoning correctly.", "sample": "Stated the final outcome without explaining why it happened."},
+            {"score": 0, "label": "Zero", "criteria": "Student gives an incorrect or misconception-based response.", "sample": "Answered based on common misconceptions."}
         ]
     else: # max_score == 4 or fallback
         rows = [
-            {"score": 4, "label": "Full marks", "criteria": "Student evaluates the flaw, identifies the error in reasoning, and corrects it with two properties.", "sample": "Boojho's claim is flawed. A grocery bag requires strength to hold heavy weights and water resistance to stay intact when wet. Dried leaves lack both, so it will tear."},
-            {"score": 3, "label": "Strong partial", "criteria": "Student identifies the reasoning flaw and corrects it with one property justified.", "sample": "It is flawed because shopping bags need strength to hold watermelons, and leaves are too weak."},
-            {"score": 2, "label": "Moderate partial", "criteria": "Student states what failed practically without framing as a reasoning flaw.", "sample": "The bag broke because it got wet and was too heavy."},
-            {"score": 1, "label": "Minimal", "criteria": "Student names a property but has no explanation.", "sample": "It is flawed because leaves are not strong."},
-            {"score": 0, "label": "Zero", "criteria": "Student defends the claim or gives irrelevant responses.", "sample": "The leaves are good because they are organic."}
+            {"score": 4, "label": "Full marks", "criteria": f"Student evaluates the scientific scenario comprehensively, identifies the reasoning flaw, and corrects it with appropriate properties of {chapter_name}.", "sample": sample_ans},
+            {"score": 3, "label": "Strong partial", "criteria": "Student identifies the flaw/error and corrects it with one property justified.", "sample": "Identified the main scientific error and corrected it, but lacked detail on the second property."},
+            {"score": 2, "label": "Moderate partial", "criteria": "Student states what failed practically without framing as a scientific reasoning flaw.", "sample": "Stated the practical outcome without explaining the underlying scientific reason."},
+            {"score": 1, "label": "Minimal", "criteria": "Student names a property or concept but has no explanation.", "sample": "Mentioned the relevant term but did not explain it."},
+            {"score": 0, "label": "Zero", "criteria": "Student defends the incorrect claim or gives irrelevant responses.", "sample": "Defended the incorrect reasoning."}
         ]
         
     return {"rows": rows}
@@ -528,10 +646,19 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
     except Exception as e:
         raise ValueError(f"Could not load Excel file: {e}")
         
-    if "Questions" not in wb.sheetnames:
-        raise ValueError("Excel file must contain a worksheet named 'Questions'")
+    matching_sheet = None
+    for name in wb.sheetnames:
+        if name.strip().lower() == "questions":
+            matching_sheet = name
+            break
+            
+    if matching_sheet is None and len(wb.sheetnames) > 0:
+        matching_sheet = wb.sheetnames[0]
         
-    sheet = wb["Questions"]
+    if matching_sheet is None:
+        raise ValueError("Excel file is empty and has no sheets")
+        
+    sheet = wb[matching_sheet]
     
     # Load Science Class 6 mapping
     parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) if '__file__' in locals() else os.path.dirname(os.getcwd())
@@ -562,6 +689,7 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
         
     predefined_topics = df_chap[['Topic ID', 'Topic']].drop_duplicates().to_dict('records')
     subject_id = str(df_chap.iloc[0]['Subject ID']).strip() if not df_chap.empty else "65ba59aef233a16d51f7163d"
+    chapter_id = str(df_chap.iloc[0]['Chapter ID']).strip() if not df_chap.empty else ""
     
     # Load Curriculum Framework dynamically for mapping NCF CG, Competency, etc.
     framework_path = os.path.join(parent_dir, "Final_Class 6_Science_Mastery Framework_ (1).xlsx")
@@ -578,7 +706,7 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
     
     # Check headers
     expected_headers = [
-        "Mastery_Level", "Topic", "Stimulus_Text", "Item_Stem",
+        "Mastery_Level", "Stimulus_Text", "Item_Stem",
         "Option_A", "Option_B", "Option_C", "Option_D",
         "Correct_Option", "Correct_Answer"
     ]
@@ -607,6 +735,33 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
             row_dict[h_name] = val
         if not row_empty:
             row_dict["_excel_row_num"] = r_idx
+            
+            # Extract and download images from Google Drive links & openpyxl embedded drawings
+            row_images = []
+            
+            # Check Item_Stem
+            stem_val = row_dict.get("Item_Stem")
+            if stem_val and isinstance(stem_val, str):
+                drive_imgs, cleaned_stem = extract_and_download_drive_images(stem_val)
+                row_images.extend(drive_imgs)
+                row_dict["Item_Stem"] = cleaned_stem
+            
+            if "Item_Stem" in header_map:
+                embedded_stem_imgs = get_images_for_cell(sheet, r_idx, header_map["Item_Stem"])
+                row_images.extend(embedded_stem_imgs)
+                
+            # Check Stimulus_Text
+            stimulus_val = row_dict.get("Stimulus_Text")
+            if stimulus_val and isinstance(stimulus_val, str):
+                drive_imgs, cleaned_stimulus = extract_and_download_drive_images(stimulus_val)
+                row_images.extend(drive_imgs)
+                row_dict["Stimulus_Text"] = cleaned_stimulus
+                
+            if "Stimulus_Text" in header_map:
+                embedded_stimulus_imgs = get_images_for_cell(sheet, r_idx, header_map["Stimulus_Text"])
+                row_images.extend(embedded_stimulus_imgs)
+                
+            row_dict["_images"] = row_images
             raw_rows.append(row_dict)
             
     total_raw = len(raw_rows)
@@ -748,13 +903,31 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
             item_learning_outcome = combo['learning_outcome']
             item_lo_id = compute_lo_id(combo, unique_combos)
         else:
-            item_ncf_cg = "CG-1"
-            item_competency = "C-1.1"
-            item_learning_outcome = "Identifies and explains different properties of materials and relates them to their uses."
-            item_lo_id = "LO-1.1.a"
+            # Fallback to the first entry in unique_combos matching this chapter
+            chap_fallback = None
+            if unique_combos:
+                norm_matched_chap = re.sub(r"[\s\n\r\t]+", " ", matched_chapter.lower().strip())
+                for c in unique_combos:
+                    norm_c_chap = re.sub(r"[\s\n\r\t]+", " ", c["chapter_name"].lower().strip())
+                    if norm_matched_chap in norm_c_chap or norm_c_chap in norm_matched_chap:
+                        chap_fallback = c
+                        break
+            if chap_fallback:
+                item_ncf_cg = chap_fallback['ncf_cg']
+                item_competency = chap_fallback['competency']
+                item_learning_outcome = chap_fallback['learning_outcome']
+                item_lo_id = compute_lo_id(chap_fallback, unique_combos)
+            else:
+                item_ncf_cg = "CG-1"
+                item_competency = "C-1.1"
+                item_learning_outcome = "Identifies and explains different properties of materials and relates them to their uses."
+                item_lo_id = "LO-1.1.a"
 
-        # Temp ID for display
-        temp_id = f"G6-{batch_meta['chapter_code']}-{item_topic_id}-{mastery_excel or 'MX'}-XXX"
+        # Sequence number starts from start_seq and increments sequentially for each item in this run
+        item_seq = i + batch_meta.get("start_seq", 1)
+
+        # Temp ID for display (starts sequentially, no more -XXX)
+        temp_id = f"G6-{chapter_id}-{item_topic_id}-{mastery_excel or 'MX'}-{item_seq:03d}"
         
         # Log update to Streamlit UI
         if progress_callback:
@@ -808,7 +981,8 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
                 
                 c1_res = call_mistral(client, system_prompt_c1, user_msg_c1, max_tokens=150, use_json=True)
             except Exception as exc:
-                c1_res = {"mastery_level": "M2", "reasoning": f"Fallback to M2 due to API error: {exc}", "operator_override": False}
+                fallback_level = mastery_excel if mastery_excel in ("M1", "M2", "M3", "M4") else "M2"
+                c1_res = {"mastery_level": fallback_level, "reasoning": f"Fallback to {fallback_level} due to API error: {exc}", "operator_override": False}
                 
         confirmed_mastery = c1_res.get("mastery_level", "M2").upper()
         if confirmed_mastery not in ("M1", "M2", "M3", "M4"):
@@ -844,14 +1018,8 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
             msg = f"WARNING: {confirmed_mastery} item is missing a stimulus."
             override_msg = (override_msg + " " + msg).strip()
             
-        # Resolve sequence number for this topic
-        if item_topic_id not in current_seq:
-            current_seq[item_topic_id] = get_next_sequence_number(batch_meta['chapter_code'], item_topic_id)
-        item_seq = current_seq[item_topic_id]
-        current_seq[item_topic_id] += 1
-        
-        # Finalized Item ID
-        item_id = f"G6-{batch_meta['chapter_code']}-{item_topic_id}-{confirmed_mastery}-{item_seq:03d}"
+        # Finalized Item ID (using the sequence number resolved earlier)
+        item_id = f"G6-{chapter_id}-{item_topic_id}-{confirmed_mastery}-{item_seq:03d}"
         
         # ─── CALL 2: FORMAT FIELD INFERENCE ──────────────────────────────────
         if progress_callback:
@@ -892,6 +1060,8 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
                 c2_res = {"has_image": "No", "has_table": "No", "has_equation": "No", "equation_format": "N/A"}
                 
         has_image = str(c2_res.get("has_image", "No")).strip().capitalize()
+        if row.get("_images"):
+            has_image = "Yes"
         has_table = str(c2_res.get("has_table", "No")).strip().capitalize()
         has_equation = str(c2_res.get("has_equation", "No")).strip().capitalize()
         
@@ -914,7 +1084,7 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
                 progress_callback(i + 1, total_valid, item_id, confirmed_mastery, "Generating distractor rationales...")
                 
             if is_mock:
-                distractor_rationales = generate_mock_rationales(row, correct_opt)
+                distractor_rationales = generate_mock_rationales(row, correct_opt, chapter_name=matched_chapter)
             else:
                 try:
                     system_prompt_c3 = (
@@ -950,14 +1120,14 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
                     distractor_rationales = call_mistral(client, system_prompt_c3, user_msg_c3, max_tokens=600, use_json=True)
                 except Exception:
                     # Fallback manually
-                    distractor_rationales = generate_mock_rationales(row, correct_opt)
+                    distractor_rationales = generate_mock_rationales(row, correct_opt, chapter_name=matched_chapter)
                     
         # ─── CALL 4: ANSWER EXPLANATION GENERATION ────────────────────────────
         if progress_callback:
             progress_callback(i + 1, total_valid, item_id, confirmed_mastery, "Generating answer explanation...")
             
         if is_mock:
-            explanation_text = generate_mock_explanation(row, item_type, correct_opt, distractor_rationales)
+            explanation_text = generate_mock_explanation(row, item_type, correct_opt, distractor_rationales, chapter_name=matched_chapter)
         else:
             try:
                 system_prompt_c4 = (
@@ -993,7 +1163,7 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
                 
                 explanation_text = call_mistral(client, system_prompt_c4, user_msg_c4, max_tokens=500, use_json=False)
             except Exception:
-                explanation_text = generate_mock_explanation(row, item_type, correct_opt, distractor_rationales)
+                explanation_text = generate_mock_explanation(row, item_type, correct_opt, distractor_rationales, chapter_name=matched_chapter)
                 
         # ─── DETERMINISTIC RULES DERIVATIONS ──────────────────────────────────
         blooms = {
@@ -1056,7 +1226,7 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
                 progress_callback(i + 1, total_valid, item_id, confirmed_mastery, "Generating marking rubric...")
                 
             if is_mock:
-                rubric_data = generate_mock_rubric(row, max_score)
+                rubric_data = generate_mock_rubric(row, max_score, chapter_name=matched_chapter)
             else:
                 try:
                     system_prompt_c5 = (
@@ -1127,7 +1297,7 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
                     
                     rubric_data = call_mistral(client, system_prompt_c5, user_msg_c5, max_tokens=800, use_json=True)
                 except Exception:
-                    rubric_data = generate_mock_rubric(row, max_score)
+                    rubric_data = generate_mock_rubric(row, max_score, chapter_name=matched_chapter)
                     
             # Rubric Quality Check (Rule 7.6)
             rows = rubric_data.get("rows", [])
@@ -1168,6 +1338,7 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
         # Compile item dictionary
         enriched_item = {
             "Item_ID": item_id,
+            "images": row.get("_images", []),
             "Mastery_Level": confirmed_mastery,
             "Blooms_Level": blooms,
             "DoK_Level": dok,
@@ -1366,7 +1537,25 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
         t10 = create_styled_table(doc, 1, [2000, 7360])
         set_cell_shading(t10.rows[0].cells[0], "e2e8f0")
         set_cell_text(t10.rows[0].cells[0], "Stimulus text", bold=True)
-        set_cell_text(t10.rows[0].cells[1], item["Stimulus_Text"])
+        stim_cell = t10.rows[0].cells[1]
+        set_cell_text(stim_cell, item["Stimulus_Text"])
+        
+        # If there are images, attach them to the Stimulus block
+        if item.get("images"):
+            for img_bytes in item["images"]:
+                p = stim_cell.add_paragraph()
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                p.paragraph_format.space_before = Pt(6)
+                p.paragraph_format.space_after = Pt(6)
+                run = p.add_run()
+                try:
+                    img_stream = io.BytesIO(img_bytes)
+                    run.add_picture(img_stream, width=Inches(4.0))
+                except Exception as img_err:
+                    p_err = stim_cell.add_paragraph()
+                    r_err = p_err.add_run(f"[Error rendering attached image: {img_err}]")
+                    r_err.font.italic = True
+                    r_err.font.color.rgb = RGBColor(255, 0, 0)
         
         # Subsection Header
         add_section_header(doc, "B2.  Item Stem  ", "(the question or instruction the learner must respond to)")
@@ -1393,9 +1582,12 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
                 is_correct = "Yes" if item["Correct_Option"] == letter else "No"
                 opt_val = item[f"Option_{letter}"]
                 
-                # Combine option text and distractor rationale in cell
-                rat = item["Distractor_Rationales"].get(f"rationale_{letter.lower()}", "")
-                combined_opt_text = f"{opt_val}\n{rat}"
+                # Combine option text and distractor rationale in cell (for incorrect options only)
+                if is_correct == "No":
+                    rat = item["Distractor_Rationales"].get(f"rationale_{letter.lower()}", "")
+                    combined_opt_text = f"{opt_val}\n{rat}" if rat else opt_val
+                else:
+                    combined_opt_text = opt_val
                 
                 set_cell_text(t12.rows[r_idx].cells[0], letter, bold=True)
                 set_cell_text(t12.rows[r_idx].cells[1], is_correct)

@@ -22,6 +22,46 @@ except ImportError:
 from generate_items import run_pipeline
 from curriculum_analyzer import analyze_curriculum_alignment, CHAPTER_CODES
 
+import re
+
+# Load chapter mapping from Science Class 6.xlsx
+CHAPTER_IDS = {
+    "a journey through states of water": "67ff3d8b2613c0dfa772579b",
+    "beyond earth": "67ff3d8a2613c0dfa7725785",
+    "diversity in the living world": "67ff3d8a2613c0dfa7725742",
+    "exploring magnets": "67ff3d8a2613c0dfa772574f",
+    "living creatures": "67ff3d8b2613c0dfa7725792",
+    "living creatures: exploring their characteristics": "67ff3d8b2613c0dfa7725792",
+    "materials around us": "67ff3d8a2613c0dfa7725765",
+    "measurement of length and motion": "67ff3d8a2613c0dfa772576c",
+    "method of separation in everyday life": "68d260c812d191aeb6c953e6",
+    "methods of separation": "68d260c812d191aeb6c953e6",
+    "mindful eating": "67ff3d8a2613c0dfa772575a",
+    "mindful eating: a path to a healthy body": "67ff3d8a2613c0dfa772575a",
+    "nature's treasures": "67ff3d8b2613c0dfa77257af",
+    "nature’s treasures": "67ff3d8b2613c0dfa77257af",
+    "temperature and its measurement": "67ff3d8a2613c0dfa7725771",
+    "the wonderful world of science": "68d2604a12d191aeb6c9320b",
+}
+
+try:
+    science_file_path = "Science Class 6.xlsx"
+    if not os.path.exists(science_file_path):
+        science_file_path = os.path.join(os.path.dirname(os.getcwd()), "Science Class 6.xlsx")
+    if not os.path.exists(science_file_path):
+        parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) if '__file__' in locals() else os.path.dirname(os.getcwd())
+        science_file_path = os.path.join(parent_dir, "Science Class 6.xlsx")
+        
+    df_science = pd.read_excel(science_file_path)
+    for idx, row in df_science.iterrows():
+        chap = row.get("Chapter")
+        cid = row.get("Chapter ID")
+        if chap and cid:
+            norm_name = re.sub(r'\s+', ' ', str(chap).lower().strip())
+            CHAPTER_IDS[norm_name] = str(cid).strip()
+except Exception as e:
+    pass
+
 # Load chapters from Question Bank Count (1).xlsx
 try:
     parent_dir = os.path.dirname(os.getcwd())
@@ -90,7 +130,7 @@ def handle_file_upload():
 
 # ─── Header ────────────────────────────────────────────────────────────────────
 st.title("🔬 Science PAL — Bulk Item Authoring Pipeline")
-st.markdown("*Grade 6 · NCF 2023 Aligned · AI-Powered Item Bank Generator · Built for TechCurators*")
+st.markdown("*Grade 6 · AI-Powered Item Bank Generator · Built for TechCurators*")
 st.divider()
 
 # ─── Sidebar ───────────────────────────────────────────────────────────────────
@@ -135,8 +175,9 @@ with st.sidebar:
     )
     st.session_state["chapter_name"] = chapter_name_input
     
-    # Automatically map and resolve chapter code
-    chap_code = CHAPTER_CODES.get(chapter_name_input.lower().strip(), chapter_name_input[:3].upper())
+    # Automatically map and resolve chapter code to Chapter ID
+    norm_chap = re.sub(r'\s+', ' ', chapter_name_input.lower().strip())
+    chap_code = CHAPTER_IDS.get(norm_chap, chapter_name_input[:3].upper())
     st.session_state["chapter_code"] = chap_code
 
 
@@ -148,7 +189,7 @@ with col_main:
     uploaded_file = st.file_uploader(
         "Upload `Qs_Creation_Template_PAL_Science.xlsx` (or compatible file)",
         type=["xlsx", "xls"],
-        help="Must contain a sheet named 'Questions' with the 10 required columns.",
+        help="Must contain a sheet with the 9 required columns.",
         key="uploader",
         on_change=handle_file_upload
     )
@@ -156,7 +197,7 @@ with col_main:
 with col_info:
     st.subheader("📋 Required Columns")
     st.code(
-        "Mastery_Level\nTopic\nStimulus_Text\nItem_Stem\n"
+        "Mastery_Level\nStimulus_Text\nItem_Stem\n"
         "Option_A\nOption_B\nOption_C\nOption_D\n"
         "Correct_Option\nCorrect_Answer",
         language="text"
@@ -167,8 +208,15 @@ if uploaded_file:
     try:
         # Load sheets to inspect
         wb = pd.ExcelFile(uploaded_file)
-        if "Questions" in wb.sheet_names:
-            df_preview = pd.read_excel(uploaded_file, sheet_name="Questions")
+        matching_sheet = None
+        for name in wb.sheet_names:
+            if name.strip().lower() == "questions":
+                matching_sheet = name
+                break
+        if matching_sheet is None and len(wb.sheet_names) > 0:
+            matching_sheet = wb.sheet_names[0]
+        if matching_sheet is not None:
+            df_preview = pd.read_excel(uploaded_file, sheet_name=matching_sheet)
             df_preview.reset_index(drop=True, inplace=True)
             # Only rows with at least a stem
             valid_rows = df_preview[df_preview["Item_Stem"].notna()].copy()
@@ -190,14 +238,14 @@ if uploaded_file:
             st.divider()
 
             with st.expander("🔍 Preview Questions Sheet", expanded=False):
-                st.dataframe(df_preview, use_container_width=True)
+                st.dataframe(df_preview, width="stretch")
 
             col_m = st.columns(4)
             for i, level in enumerate(["M1", "M2", "M3", "M4"]):
                 count = len(valid_rows[valid_rows["Mastery_Level"].astype(str).str.upper() == level])
                 col_m[i].metric(f"{level} Items", count)
         else:
-            st.error("Error: Worksheet 'Questions' not found in uploaded file. The workbook must contain a sheet named exactly 'Questions'.")
+            st.error("Error: The uploaded file is empty and has no sheets.")
             valid_rows = pd.DataFrame()
 
     except Exception as e:
@@ -240,7 +288,7 @@ if ready:
         run_clicked = st.button(
             "▶  Run Pipeline",
             type="primary",
-            use_container_width=True
+            width="stretch"
         )
 
     if run_clicked:
@@ -294,7 +342,7 @@ if ready:
                     file_name=f"Science_PAL_G6_Item_Bank_{today}.docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     type="primary",
-                    use_container_width=True,
+                    width="stretch",
                 )
             with col_dl2:
                 st.download_button(
@@ -302,7 +350,7 @@ if ready:
                     data=csv_bytes,
                     file_name=f"Science_PAL_G6_Item_Bank_{today}_log.csv",
                     mime="text/csv",
-                    use_container_width=True,
+                    width="stretch",
                 )
 
         except Exception as exc:

@@ -63,50 +63,7 @@ def normalize_text(text):
     return text
 
 def get_next_sequence_number(chapter_code, topic_code, output_dir="output"):
-    if not os.path.exists(output_dir):
-        return 1
-    
-    max_seq = 0
-    pattern = re.compile(rf"G6-{chapter_code}-{topic_code}-M[1-4]-(\d+)", re.IGNORECASE)
-    generic_pattern = re.compile(r"G6-[A-Z0-9]{3,10}-[a-zA-Z0-9_-]{3,24}-M[1-4]-(\d+)", re.IGNORECASE)
-    
-    matched_specific = False
-    
-    for file in os.listdir(output_dir):
-        if file.endswith(".csv") and "_log" in file:
-            csv_path = os.path.join(output_dir, file)
-            try:
-                with open(csv_path, "r", encoding="utf-8") as f:
-                    reader = csv.reader(f)
-                    headers = next(reader, None)
-                    if not headers:
-                        continue
-                    item_id_idx = -1
-                    for idx, h in enumerate(headers):
-                        if h.strip().lower() == "item_id":
-                            item_id_idx = idx
-                            break
-                    
-                    if item_id_idx != -1:
-                        for row in reader:
-                            if len(row) > item_id_idx:
-                                item_id = row[item_id_idx].strip().upper()
-                                m = pattern.match(item_id)
-                                if m:
-                                    matched_specific = True
-                                    seq = int(m.group(1))
-                                    if seq > max_seq:
-                                        max_seq = seq
-                                elif not matched_specific:
-                                    gm = generic_pattern.match(item_id)
-                                    if gm:
-                                        seq = int(gm.group(1))
-                                        if seq > max_seq:
-                                            max_seq = seq
-            except Exception:
-                pass
-                
-    return max_seq + 1
+    return 1
 
 def find_in_blueprint(topic_query):
     blueprint_path = r"1. Test Blueprint _Grade 6 (1).xlsx"
@@ -142,6 +99,14 @@ def find_in_blueprint(topic_query):
     return None
 
 def load_curriculum_framework(framework_path="Final_Class 6_Science_Mastery Framework_ (1).xlsx"):
+    if not os.path.exists(framework_path):
+        parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) if '__file__' in locals() else os.path.dirname(os.getcwd())
+        framework_path = os.path.join(parent_dir, "Final_Class 6_Science_Mastery Framework_ (1).xlsx")
+    if not os.path.exists(framework_path):
+        framework_path = os.path.join(os.path.dirname(os.getcwd()), "Final_Class 6_Science_Mastery Framework_ (1).xlsx")
+    if not os.path.exists(framework_path):
+        framework_path = "Final_Class 6_Science_Mastery Framework_ (1).xlsx"
+        
     if not os.path.exists(framework_path):
         return []
     try:
@@ -214,6 +179,11 @@ def analyze_curriculum_alignment(uploaded_file, api_key: str):
     """
     framework_path = r"Final_Class 6_Science_Mastery Framework_ (1).xlsx"
     if not os.path.exists(framework_path):
+        parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) if '__file__' in locals() else os.path.dirname(os.getcwd())
+        framework_path = os.path.join(parent_dir, "Final_Class 6_Science_Mastery Framework_ (1).xlsx")
+    if not os.path.exists(framework_path):
+        framework_path = os.path.join(os.path.dirname(os.getcwd()), "Final_Class 6_Science_Mastery Framework_ (1).xlsx")
+    if not os.path.exists(framework_path):
         framework_path = "Final_Class 6_Science_Mastery Framework_ (1).xlsx"
         
     # Default fallback values
@@ -232,9 +202,16 @@ def analyze_curriculum_alignment(uploaded_file, api_key: str):
         # 1. Read sheet Questions from uploaded file
         uploaded_file.seek(0)
         wb_upload = openpyxl.load_workbook(uploaded_file, data_only=True)
-        if "Questions" not in wb_upload.sheetnames:
+        matching_sheet = None
+        for name in wb_upload.sheetnames:
+            if name.strip().lower() == "questions":
+                matching_sheet = name
+                break
+        if matching_sheet is None and len(wb_upload.sheetnames) > 0:
+            matching_sheet = wb_upload.sheetnames[0]
+        if matching_sheet is None:
             return result
-        sheet = wb_upload["Questions"]
+        sheet = wb_upload[matching_sheet]
         
         headers = [str(cell.value).strip() if cell.value is not None else "" for cell in sheet[1]]
         topic_idx = -1
@@ -308,13 +285,50 @@ def analyze_curriculum_alignment(uploaded_file, api_key: str):
             result["competency"] = matched_combo["competency"]
             result["learning_outcome"] = matched_combo["learning_outcome"]
             
-            # Map Chapter Code
-            norm_chap = normalize_text(result["chapter_name"])
+            # Map Chapter Code to Chapter ID
             chapter_code = None
-            for key, val in CHAPTER_CODES.items():
-                if normalize_text(key) == norm_chap:
-                    chapter_code = val
-                    break
+            science_path = "Science Class 6.xlsx"
+            if not os.path.exists(science_path):
+                science_path = os.path.join(os.path.dirname(os.getcwd()), "Science Class 6.xlsx")
+            if not os.path.exists(science_path):
+                parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) if '__file__' in locals() else os.path.dirname(os.getcwd())
+                science_path = os.path.join(parent_dir, "Science Class 6.xlsx")
+                
+            try:
+                df_sci = pd.read_excel(science_path)
+                norm_chap_target = re.sub(r'\s+', ' ', result["chapter_name"].lower().strip())
+                for idx, r in df_sci.iterrows():
+                    chap_val = r.get("Chapter")
+                    cid_val = r.get("Chapter ID")
+                    if chap_val and cid_val:
+                        norm_chap_val = re.sub(r'\s+', ' ', str(chap_val).lower().strip())
+                        if norm_chap_val == norm_chap_target:
+                            chapter_code = str(cid_val).strip()
+                            break
+            except Exception:
+                pass
+                
+            if not chapter_code:
+                # Fallback mapping
+                chapter_code = {
+                    "a journey through states of water": "67ff3d8b2613c0dfa772579b",
+                    "beyond earth": "67ff3d8a2613c0dfa7725785",
+                    "diversity in the living world": "67ff3d8a2613c0dfa7725742",
+                    "exploring magnets": "67ff3d8a2613c0dfa772574f",
+                    "living creatures": "67ff3d8b2613c0dfa7725792",
+                    "living creatures: exploring their characteristics": "67ff3d8b2613c0dfa7725792",
+                    "materials around us": "67ff3d8a2613c0dfa7725765",
+                    "measurement of length and motion": "67ff3d8a2613c0dfa772576c",
+                    "method of separation in everyday life": "68d260c812d191aeb6c953e6",
+                    "methods of separation": "68d260c812d191aeb6c953e6",
+                    "mindful eating": "67ff3d8a2613c0dfa772575a",
+                    "mindful eating: a path to a healthy body": "67ff3d8a2613c0dfa772575a",
+                    "nature's treasures": "67ff3d8b2613c0dfa77257af",
+                    "nature’s treasures": "67ff3d8b2613c0dfa77257af",
+                    "temperature and its measurement": "67ff3d8a2613c0dfa7725771",
+                    "the wonderful world of science": "68d2604a12d191aeb6c9320b",
+                }.get(re.sub(r'\s+', ' ', result["chapter_name"].lower().strip()))
+                
             if not chapter_code:
                 chapter_code = result["chapter_name"][:3].upper()
             result["chapter_code"] = chapter_code
