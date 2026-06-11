@@ -12,19 +12,24 @@ from mistralai.client import Mistral
 # Standard Chapter Codes for Grade 6 Science
 CHAPTER_CODES = {
     "materials around us": "MAT",
+    "living creatures": "LIV",
     "living creatures: exploring their characteristics": "LIV",
     "living creatures: exploring\ntheir characteristics": "LIV",
     "the wonderful world of science": "SCI",
     "diversity in the living world": "DIV",
     "exploring magnets": "MAG",
+    "mindful eating": "EAT",
     "mindful eating: a path  to a healthy body": "EAT",
     "mindful eating: a path to a healthy body": "EAT",
     "measurement of length and motion": "MEA",
     "measurement of length\nand motion": "MEA",
     "temperature and its measurement": "TEM",
     "a journey through states of water": "WAT",
+    "methods of separation": "SEP",
     "methods of separation in everyday life": "SEP",
+    "method of separation in everyday life": "SEP",
     "nature's treasures": "NAT",
+    "nature’s treasures": "NAT",
     "beyond earth": "BEY"
 }
 
@@ -62,8 +67,8 @@ def get_next_sequence_number(chapter_code, topic_code, output_dir="output"):
         return 1
     
     max_seq = 0
-    pattern = re.compile(rf"G6-{chapter_code}-{topic_code}-M[1-4]-(\d+)")
-    generic_pattern = re.compile(r"G6-[A-Z]{3,10}-[A-Z]{3,10}-M[1-4]-(\d+)")
+    pattern = re.compile(rf"G6-{chapter_code}-{topic_code}-M[1-4]-(\d+)", re.IGNORECASE)
+    generic_pattern = re.compile(r"G6-[A-Z0-9]{3,10}-[a-zA-Z0-9_-]{3,24}-M[1-4]-(\d+)", re.IGNORECASE)
     
     matched_specific = False
     

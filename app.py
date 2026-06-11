@@ -20,7 +20,32 @@ except ImportError:
                     os.environ[key.strip()] = val.strip()
 
 from generate_items import run_pipeline
-from curriculum_analyzer import analyze_curriculum_alignment
+from curriculum_analyzer import analyze_curriculum_alignment, CHAPTER_CODES
+
+# Load chapters from Question Bank Count (1).xlsx
+try:
+    parent_dir = os.path.dirname(os.getcwd())
+    qbank_path = os.path.join(parent_dir, "Question Bank Count (1).xlsx")
+    if not os.path.exists(qbank_path):
+        qbank_path = "Question Bank Count (1).xlsx"
+    df_qbank = pd.read_excel(qbank_path)
+    df_qbank_g6 = df_qbank[df_qbank['Grade'] == 6]
+    qbank_chapters = df_qbank_g6['Chapter'].dropna().map(lambda x: str(x).strip()).unique().tolist()
+except Exception as e:
+    # Fallback to predefined Grade 6 chapters if loading fails
+    qbank_chapters = [
+        "Materials Around Us",
+        "Living Creatures",
+        "Diversity in the Living World",
+        "Exploring Magnets",
+        "Mindful Eating",
+        "Measurement of Length and Motion",
+        "Temperature and its Measurement",
+        "A Journey through States of Water",
+        "Methods of Separation",
+        "Nature’s Treasures",
+        "Beyond Earth"
+    ]
 
 st.set_page_config(
     page_title="Science PAL — Item Bank Generator",
@@ -91,31 +116,29 @@ with st.sidebar:
     st.subheader("📚 Batch Metadata")
     st.caption("Applied to ALL items in this upload.")
 
-    chapter_name_input = st.text_input(
+    # Selectbox dropdown menu for Chapter Name
+    default_chap = st.session_state.get("chapter_name", "Materials Around Us")
+    default_idx = 0
+    if default_chap in qbank_chapters:
+        default_idx = qbank_chapters.index(default_chap)
+    else:
+        for idx, chap in enumerate(qbank_chapters):
+            if chap.lower().strip() == default_chap.lower().strip():
+                default_idx = idx
+                break
+
+    chapter_name_input = st.selectbox(
         "Chapter Name *",
-        value=st.session_state.get("chapter_name", "Materials Around Us"),
-        placeholder="Materials Around Us",
-        help="Full chapter name as it appears in the NCERT/NCF curriculum."
+        options=qbank_chapters,
+        index=default_idx,
+        help="Select the chapter name from the Question Bank Count list."
     )
     st.session_state["chapter_name"] = chapter_name_input
     
-    chapter_code_input = st.text_input(
-        "Chapter Code *",
-        value=st.session_state.get("chapter_code", "MAT"),
-        placeholder="MAT",
-        max_chars=10,
-        help="Short uppercase code used in Item ID construction (e.g., MAT, PHY)."
-    )
-    st.session_state["chapter_code"] = chapter_code_input
-    
-    topic_code_input = st.text_input(
-        "Topic Code *",
-        value=st.session_state.get("topic_code", "PROP"),
-        placeholder="PROP",
-        max_chars=10,
-        help="Short uppercase code for the topic. Topic name comes from Excel."
-    )
-    st.session_state["topic_code"] = topic_code_input
+    # Automatically map and resolve chapter code
+    chap_code = CHAPTER_CODES.get(chapter_name_input.lower().strip(), chapter_name_input[:3].upper())
+    st.session_state["chapter_code"] = chap_code
+
 
 # ─── Main Area ────────────────────────────────────────────────────────────────
 col_main, col_info = st.columns([3, 1])
@@ -155,19 +178,15 @@ if uploaded_file:
             )
             
             # Display Auto-Detected Curriculum Alignment & Sequence
-            st.markdown("### 🎯Curriculum Alignment")
+            st.markdown("### 🎯 Curriculum Alignment & Status")
             
             col1, col2 = st.columns(2)
             with col1:
-                st.markdown(f"**📌 NCF CG #:** `{st.session_state.get('ncf_cg', 'N/A')}`")
-                st.markdown(f"**💡 Competency:** `{st.session_state.get('competency', 'N/A')}`")
-                st.markdown(f"**🏷️ LO ID:** `{st.session_state.get('lo_id', 'N/A')}`")
+                st.markdown(f"**📚 Selected Chapter:** `{st.session_state.get('chapter_name', 'N/A')}`")
+                st.markdown(f"**🔑 Chapter Code:** `{st.session_state.get('chapter_code', 'N/A')}`")
             with col2:
-                st.markdown(f"**📚 Chapter:** `{st.session_state.get('chapter_name', 'N/A')}` (`{st.session_state.get('chapter_code', 'N/A')}`)")
-                st.markdown(f"**🎯 Topic Code:** `{st.session_state.get('topic_code', 'N/A')}`")
-                st.markdown(f"**🔢 Starting Sequence:** `{st.session_state.get('start_seq', 1)}`")
-                
-            st.info(f"**📖 Learning Outcome:** {st.session_state.get('learning_outcome', 'N/A')}")
+                st.markdown(f"**🎯 Topic & Subject IDs:** `Auto-detected per item`")
+                st.markdown(f"**🔢 Sequence Numbering:** `Auto-managed per topic`")
             st.divider()
 
             with st.expander("🔍 Preview Questions Sheet", expanded=False):
@@ -193,7 +212,6 @@ ready = (
     and st.session_state.get("api_key", "").strip() != ""
     and st.session_state.get("chapter_name", "").strip() != ""
     and st.session_state.get("chapter_code", "").strip() != ""
-    and st.session_state.get("topic_code", "").strip() != ""
     and len(valid_rows) > 0
 )
 
@@ -203,7 +221,6 @@ if not ready:
     if not st.session_state.get("api_key", "").strip(): missing.append("Mistral API key")
     if not st.session_state.get("chapter_name", "").strip(): missing.append("Chapter Name")
     if not st.session_state.get("chapter_code", "").strip(): missing.append("Chapter Code")
-    if not st.session_state.get("topic_code", "").strip(): missing.append("Topic Code")
     if missing:
         st.warning(f"⚠️ Please provide: {', '.join(missing)}")
 
@@ -243,7 +260,6 @@ if ready:
         batch_meta = {
             "chapter_name": st.session_state.get("chapter_name", "").strip(),
             "chapter_code": st.session_state.get("chapter_code", "").strip().upper(),
-            "topic_code": st.session_state.get("topic_code", "").strip().upper(),
             "ncf_cg": st.session_state.get("ncf_cg", "").strip(),
             "competency": st.session_state.get("competency", "").strip(),
             "learning_outcome": st.session_state.get("learning_outcome", "").strip(),

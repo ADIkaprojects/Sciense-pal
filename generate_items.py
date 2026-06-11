@@ -16,6 +16,8 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from mistralai.client import Mistral
 
+from curriculum_analyzer import load_curriculum_framework, get_next_sequence_number
+
 # ─── MISTRAL CLIENT SETUP ──────────────────────────────────────────────────────
 MODEL = "mistral-large-latest"
 
@@ -332,6 +334,188 @@ def generate_mock_rubric(row, max_score):
         
     return {"rows": rows}
 
+def get_matching_chapter_in_science_excel(selected_chap, excel_chapters):
+    mapping = {
+        "materials around us": "Materials Around Us",
+        "living creatures": "Living Creatures: Exploring  their Characteristics",
+        "diversity in the living world": "Diversity in the Living World",
+        "exploring magnets": "Exploring Magnets",
+        "mindful eating": "Mindful Eating: A Path  to a Healthy Body",
+        "measurement of length and motion": "Measurement of Length and Motion",
+        "temperature and its measurement": "Temperature and its Measurement",
+        "a journey through states of water": "A Journey through States of Water",
+        "methods of separation": "Method of Separation In Everyday Life",
+        "nature's treasures": "Nature’s Treasures",
+        "nature’s treasures": "Nature’s Treasures",
+        "beyond earth": "Beyond Earth"
+    }
+    
+    sel_norm = str(selected_chap).lower().strip().replace("’", "'").replace("`", "'")
+    if sel_norm in mapping:
+        mapped_name = mapping[sel_norm]
+        for ec in excel_chapters:
+            if ec.lower().strip().replace("’", "'").replace("`", "'") == mapped_name.lower().replace("’", "'"):
+                return ec
+    
+    for ec in excel_chapters:
+        ec_norm = ec.lower().strip().replace("’", "'").replace("`", "'")
+        if sel_norm in ec_norm or ec_norm in sel_norm:
+            return ec
+            
+    sel_words = set(sel_norm.split())
+    for ec in excel_chapters:
+        ec_words = set(ec.lower().strip().replace("’", "'").replace("`", "'").split())
+        if sel_words.intersection(ec_words):
+            return ec
+            
+    return selected_chap
+
+def match_topic_heuristically(row_topic_or_stem, predefined_topics):
+    if not predefined_topics:
+        return None
+    
+    row_topic_norm = str(row_topic_or_stem).lower().strip()
+    
+    best_match = None
+    best_score = -1
+    
+    for pt in predefined_topics:
+        topic_name = pt['Topic']
+        topic_norm = str(topic_name).lower().strip()
+        
+        if topic_norm == row_topic_norm:
+            return pt
+            
+        if topic_norm in row_topic_norm or row_topic_norm in topic_norm:
+            score = len(topic_norm)
+            if score > best_score:
+                best_score = score
+                best_match = pt
+                
+    if best_match:
+        return best_match
+        
+    for pt in predefined_topics:
+        topic_name = pt['Topic']
+        topic_words = set(re.findall(r'\w+', str(topic_name).lower()))
+        input_words = set(re.findall(r'\w+', str(row_topic_or_stem).lower()))
+        overlap = len(topic_words.intersection(input_words))
+        if overlap > best_score:
+            best_score = overlap
+            best_match = pt
+            
+    return best_match or predefined_topics[0]
+
+def classify_topic_with_ai(client, item_stem, stimulus_text, predefined_topics, row_topic=None):
+    if not predefined_topics:
+        return None
+        
+    if client is None:
+        query = row_topic if row_topic else item_stem
+        return match_topic_heuristically(query, predefined_topics)
+        
+    topics_list_str = ""
+    for pt in predefined_topics:
+        topics_list_str += f"- {pt['Topic']}\n"
+        
+    system_prompt = (
+        "You are an educational curriculum mapping AI.\n"
+        "Your task is to classify a science assessment item into exactly one topic from the predefined list of topics below.\n"
+        "You must choose the topic that best matches the scientific concept tested in the question.\n\n"
+        "PREDEFINED TOPICS:\n"
+        f"{topics_list_str}\n"
+        "INSTRUCTIONS:\n"
+        "1. Choose the topic from the predefined list that is the best match for the question.\n"
+        "2. Your output MUST be a JSON object containing exactly the key 'selected_topic' with the exact name of the topic from the list.\n"
+        "3. Do not invent any new topics. Only select from the provided list."
+    )
+    
+    user_message = (
+        f"Item Stem: {item_stem}\n"
+        f"Stimulus: {stimulus_text if stimulus_text else 'None'}\n"
+    )
+    if row_topic:
+        user_message += f"Original Topic suggestion from Excel: {row_topic}\n"
+        
+    try:
+        res = call_mistral(client, system_prompt, user_message, max_tokens=150, use_json=True)
+        selected_name = res.get("selected_topic", "").strip()
+        
+        for pt in predefined_topics:
+            if pt['Topic'].lower().strip() == selected_name.lower().strip():
+                return pt
+                
+        for pt in predefined_topics:
+            if selected_name.lower() in pt['Topic'].lower() or pt['Topic'].lower() in selected_name.lower():
+                return pt
+    except Exception as e:
+        print(f"Topic classification AI call failed: {e}")
+        
+    query = row_topic if row_topic else item_stem
+    return match_topic_heuristically(query, predefined_topics)
+
+def get_framework_alignment_for_topic(topic_name, chapter_name, unique_combos):
+    norm_topic = str(topic_name).lower().strip().replace("’", "'").replace("`", "'")
+    norm_chap = str(chapter_name).lower().strip().replace("’", "'").replace("`", "'")
+    
+    for combo in unique_combos:
+        c_topic = str(combo["topic_name"]).lower().strip().replace("’", "'").replace("`", "'")
+        c_chap = str(combo["chapter_name"]).lower().strip().replace("’", "'").replace("`", "'")
+        if c_topic == norm_topic and (norm_chap in c_chap or c_chap in norm_chap):
+            return combo
+            
+    for combo in unique_combos:
+        c_topic = str(combo["topic_name"]).lower().strip().replace("’", "'").replace("`", "'")
+        if c_topic == norm_topic:
+            return combo
+            
+    for combo in unique_combos:
+        c_topic = str(combo["topic_name"]).lower().strip().replace("’", "'").replace("`", "'")
+        if norm_topic in c_topic or c_topic in norm_topic:
+            return combo
+            
+    for combo in unique_combos:
+        c_chap = str(combo["chapter_name"]).lower().strip().replace("’", "'").replace("`", "'")
+        if norm_chap in c_chap or c_chap in norm_chap:
+            return combo
+            
+    return None
+
+def compute_lo_id(combo, unique_combos):
+    comp = combo.get("competency", "C-1.1")
+    lo = combo.get("learning_outcome", "")
+    
+    comp_num = "1.1"
+    m_comp = re.search(r"C-(\d+\.\d+)", comp)
+    if m_comp:
+        comp_num = m_comp.group(1)
+    else:
+        m_num = re.search(r"(\d+\.\d+)", comp)
+        if m_num:
+            comp_num = m_num.group(1)
+            
+    comp_los = []
+    seen_lo = set()
+    for entry in unique_combos:
+        if entry["competency"] == comp:
+            lo_clean = entry["learning_outcome"].strip()
+            if lo_clean not in seen_lo:
+                seen_lo.add(lo_clean)
+                comp_los.append(lo_clean)
+                
+    try:
+        curr_lo = lo.strip()
+        match_lo_idx = 0
+        for idx, entry_lo in enumerate(comp_los):
+            if entry_lo.lower().strip() == curr_lo.lower().strip():
+                match_lo_idx = idx
+                break
+        suffix_letter = chr(ord('a') + match_lo_idx)
+    except Exception:
+        suffix_letter = 'a'
+        
+    return f"LO-{comp_num}.{suffix_letter}"
+
 # ─── CORE PIPELINE RUNNER ─────────────────────────────────────────────────────
 def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
     """
@@ -348,6 +532,49 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
         raise ValueError("Excel file must contain a worksheet named 'Questions'")
         
     sheet = wb["Questions"]
+    
+    # Load Science Class 6 mapping
+    parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) if '__file__' in locals() else os.path.dirname(os.getcwd())
+    science_path = os.path.join(parent_dir, "Science Class 6.xlsx")
+    if not os.path.exists(science_path):
+        science_path = os.path.join(os.path.dirname(os.getcwd()), "Science Class 6.xlsx")
+    if not os.path.exists(science_path):
+        science_path = "Science Class 6.xlsx"
+        
+    try:
+        df_science = pd.read_excel(science_path)
+    except Exception as e:
+        raise ValueError(f"Could not load Science Class 6.xlsx: {e}")
+        
+    # Get the list of all unique chapters in the Science Class 6 sheet
+    excel_chapters = df_science['Chapter'].dropna().unique().tolist()
+    
+    # Map batch_meta["chapter_name"] to the exact name in the excel
+    matched_chapter = get_matching_chapter_in_science_excel(batch_meta["chapter_name"], excel_chapters)
+    
+    # Filter the Science Class 6 sheet to get predefined topics for this chapter
+    df_chap = df_science[df_science['Chapter'] == matched_chapter]
+    if df_chap.empty:
+        df_chap = df_science[df_science['Chapter'].str.contains(matched_chapter[:10], case=False, na=False)]
+        
+    if df_chap.empty:
+        raise ValueError(f"No topics found for chapter '{matched_chapter}' in Science Class 6.xlsx")
+        
+    predefined_topics = df_chap[['Topic ID', 'Topic']].drop_duplicates().to_dict('records')
+    subject_id = str(df_chap.iloc[0]['Subject ID']).strip() if not df_chap.empty else "65ba59aef233a16d51f7163d"
+    
+    # Load Curriculum Framework dynamically for mapping NCF CG, Competency, etc.
+    framework_path = os.path.join(parent_dir, "Final_Class 6_Science_Mastery Framework_ (1).xlsx")
+    if not os.path.exists(framework_path):
+        framework_path = os.path.join(os.path.dirname(os.getcwd()), "Final_Class 6_Science_Mastery Framework_ (1).xlsx")
+    if not os.path.exists(framework_path):
+        framework_path = "Final_Class 6_Science_Mastery Framework_ (1).xlsx"
+        
+    unique_combos = load_curriculum_framework(framework_path)
+    
+    # Track sequence number per topic ID
+    current_seq = {}
+
     
     # Check headers
     expected_headers = [
@@ -509,8 +736,25 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
         correct_opt = str(row.get("Correct_Option") or "").strip().upper()
         correct_ans = str(row.get("Correct_Answer") or "").strip()
         
+        # ─── TOPIC CLASSIFICATION & ALIGNMENT ─────────────────────────────────
+        pt = classify_topic_with_ai(client, stem, stimulus, predefined_topics, row_topic=topic)
+        item_topic = pt['Topic']
+        item_topic_id = pt['Topic ID']
+        
+        combo = get_framework_alignment_for_topic(item_topic, matched_chapter, unique_combos)
+        if combo:
+            item_ncf_cg = combo['ncf_cg']
+            item_competency = combo['competency']
+            item_learning_outcome = combo['learning_outcome']
+            item_lo_id = compute_lo_id(combo, unique_combos)
+        else:
+            item_ncf_cg = "CG-1"
+            item_competency = "C-1.1"
+            item_learning_outcome = "Identifies and explains different properties of materials and relates them to their uses."
+            item_lo_id = "LO-1.1.a"
+
         # Temp ID for display
-        temp_id = f"G6-{batch_meta['chapter_code']}-{batch_meta['topic_code']}-{mastery_excel or 'MX'}-{seq_num:03d}"
+        temp_id = f"G6-{batch_meta['chapter_code']}-{item_topic_id}-{mastery_excel or 'MX'}-XXX"
         
         # Log update to Streamlit UI
         if progress_callback:
@@ -600,8 +844,14 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
             msg = f"WARNING: {confirmed_mastery} item is missing a stimulus."
             override_msg = (override_msg + " " + msg).strip()
             
+        # Resolve sequence number for this topic
+        if item_topic_id not in current_seq:
+            current_seq[item_topic_id] = get_next_sequence_number(batch_meta['chapter_code'], item_topic_id)
+        item_seq = current_seq[item_topic_id]
+        current_seq[item_topic_id] += 1
+        
         # Finalized Item ID
-        item_id = f"G6-{batch_meta['chapter_code']}-{batch_meta['topic_code']}-{confirmed_mastery}-{seq_num:03d}"
+        item_id = f"G6-{batch_meta['chapter_code']}-{item_topic_id}-{confirmed_mastery}-{item_seq:03d}"
         
         # ─── CALL 2: FORMAT FIELD INFERENCE ──────────────────────────────────
         if progress_callback:
@@ -641,10 +891,21 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
             except Exception as exc:
                 c2_res = {"has_image": "No", "has_table": "No", "has_equation": "No", "equation_format": "N/A"}
                 
-        has_image = c2_res.get("has_image", "No")
-        has_table = c2_res.get("has_table", "No")
-        has_equation = c2_res.get("has_equation", "No")
-        eq_format = c2_res.get("equation_format", "N/A")
+        has_image = str(c2_res.get("has_image", "No")).strip().capitalize()
+        has_table = str(c2_res.get("has_table", "No")).strip().capitalize()
+        has_equation = str(c2_res.get("has_equation", "No")).strip().capitalize()
+        
+        # Clean up eq_format to be LaTeX or Image if Has_Equation is Yes, else blank
+        eq_format_raw = str(c2_res.get("equation_format", "")).strip()
+        if has_equation == "Yes":
+            if "latex" in eq_format_raw.lower():
+                eq_format = "LaTeX"
+            elif "image" in eq_format_raw.lower():
+                eq_format = "Image"
+            else:
+                eq_format = "LaTeX" # default fallback
+        else:
+            eq_format = ""
         
         # ─── CALL 3: DISTRACTOR RATIONALE GENERATION (MCQ Only) ───────────────
         distractor_rationales = {}
@@ -923,7 +1184,13 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
             "Has_Equation": has_equation,
             "Equation_Format": eq_format if has_equation == "Yes" else "",
             "Feedback_Type": feedback_type,
-            "Topic": topic,
+            "Topic": item_topic,
+            "Topic_ID": item_topic_id,
+            "Subject_ID": subject_id,
+            "NCF_CG": item_ncf_cg,
+            "Competency": item_competency,
+            "Learning_Outcome": item_learning_outcome,
+            "LO_ID": item_lo_id,
             "Stimulus_Text": stimulus,
             "Item_Stem": stem,
             "Explanation": explanation_text,
@@ -953,8 +1220,7 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
             "Overrides": override_msg
         })
         
-        # Increment sequence number for next item
-        seq_num += 1
+        pass
         
     # ─── 3. GENERATE DOCX FILE ────────────────────────────────────────────────
     if progress_callback:
@@ -1009,11 +1275,11 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
         # Table 3: Alignment Metadata
         t3 = create_styled_table(doc, 5, [1600, 3080, 1600, 3080])
         labels_t3 = [
-            [("Grade *", True), ("6", False), ("Subject *", True), ("Science", False)],
+            [("Grade *", True), ("6", False), ("Subject ID *", True), (item["Subject_ID"], False)],
             [("Chapter *", True), (batch_meta["chapter_name"], False), ("Chapter Code *", True), (batch_meta["chapter_code"], False)],
-            [("Topic *", True), (item["Topic"], False), ("Topic Code *", True), (batch_meta["topic_code"], False)],
-            [("NCF CG #", True), (batch_meta["ncf_cg"], False), ("Competency", True), (batch_meta["competency"], False)],
-            [("Learning Outcome *", True), (batch_meta["learning_outcome"], False), ("LO ID", True), (batch_meta["lo_id"], False)]
+            [("Topic *", True), (item["Topic"], False), ("Topic ID *", True), (item["Topic_ID"], False)],
+            [("NCF CG #", True), (item["NCF_CG"], False), ("Competency", True), (item["Competency"], False)],
+            [("Learning Outcome *", True), (item["Learning_Outcome"], False), ("LO ID", True), (item["LO_ID"], False)]
         ]
         for r_idx, row_labels in enumerate(labels_t3):
             for c_idx, (text, is_label) in enumerate(row_labels):
