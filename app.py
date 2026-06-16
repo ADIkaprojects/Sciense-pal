@@ -94,8 +94,18 @@ st.set_page_config(
 )
 
 # ─── Initialize Session State Defaults ──────────────────────────────────────────
-if "api_key" not in st.session_state:
-    st.session_state["api_key"] = os.environ.get("MISTRAL_API_KEY", "")
+if "api_provider" not in st.session_state:
+    if os.environ.get("GROQ_API_KEY") and not os.environ.get("MISTRAL_API_KEY"):
+        st.session_state["api_provider"] = "Groq"
+    else:
+        st.session_state["api_provider"] = "Mistral"
+if "mistral_api_key" not in st.session_state:
+    st.session_state["mistral_api_key"] = os.environ.get("MISTRAL_API_KEY", "")
+if "groq_api_key" not in st.session_state:
+    st.session_state["groq_api_key"] = os.environ.get("GROQ_API_KEY", "")
+# Sync active key representation
+st.session_state["api_key"] = st.session_state["mistral_api_key"] if st.session_state["api_provider"] == "Mistral" else st.session_state["groq_api_key"]
+
 if "chapter_name" not in st.session_state:
     st.session_state["chapter_name"] = "Materials Around Us"
 if "chapter_code" not in st.session_state:
@@ -117,8 +127,12 @@ if "start_seq" not in st.session_state:
 def handle_file_upload():
     uploaded_file = st.session_state.get("uploader")
     if uploaded_file is not None:
-        api_key_val = st.session_state.get("api_key", os.environ.get("MISTRAL_API_KEY", ""))
-        alignment = analyze_curriculum_alignment(uploaded_file, api_key_val)
+        active_provider = st.session_state.get("api_provider", "Mistral")
+        if active_provider == "Mistral":
+            api_key_val = st.session_state.get("mistral_api_key", "") or os.environ.get("MISTRAL_API_KEY", "")
+        else:
+            api_key_val = st.session_state.get("groq_api_key", "") or os.environ.get("GROQ_API_KEY", "")
+        alignment = analyze_curriculum_alignment(uploaded_file, api_key_val, api_provider=active_provider)
         st.session_state["chapter_name"] = alignment["chapter_name"]
         st.session_state["chapter_code"] = alignment["chapter_code"]
         st.session_state["topic_code"] = alignment["topic_code"]
@@ -137,20 +151,41 @@ st.divider()
 with st.sidebar:
     st.header("⚙️ Pipeline Configuration")
 
-    # API Key
-    api_key_input = st.text_input(
-        "Mistral API Key",
-        value=st.session_state.get("api_key", os.environ.get("MISTRAL_API_KEY", "")),
-        type="password",
-        help="Enter key or set MISTRAL_API_KEY env variable before launching. Enter 'mock' to run locally with high-fidelity mock AI answers.",
-        placeholder="sk-..."
+    # API Provider Selection
+    api_provider = st.selectbox(
+        "API Provider",
+        options=["Mistral", "Groq"],
+        index=0 if st.session_state.get("api_provider", "Mistral") == "Mistral" else 1,
+        help="Select which AI API provider to use."
     )
-    st.session_state["api_key"] = api_key_input
+    st.session_state["api_provider"] = api_provider
+
+    # API Key Input based on provider
+    if api_provider == "Mistral":
+        api_key_input = st.text_input(
+            "Mistral API Key",
+            value=st.session_state.get("mistral_api_key", os.environ.get("MISTRAL_API_KEY", "")),
+            type="password",
+            help="Enter key or set MISTRAL_API_KEY env variable before launching. Enter 'mock' to run locally with high-fidelity mock AI answers.",
+            placeholder="sk-..."
+        )
+        st.session_state["mistral_api_key"] = api_key_input
+        st.session_state["api_key"] = api_key_input
+    else:
+        api_key_input = st.text_input(
+            "Groq API Key",
+            value=st.session_state.get("groq_api_key", os.environ.get("GROQ_API_KEY", "")),
+            type="password",
+            help="Enter key or set GROQ_API_KEY env variable before launching. Enter 'mock' to run locally with high-fidelity mock AI answers.",
+            placeholder="gsk_..."
+        )
+        st.session_state["groq_api_key"] = api_key_input
+        st.session_state["api_key"] = api_key_input
     
     if st.session_state["api_key"]:
-        st.success("✅ API key loaded")
+        st.success(f"✅ {api_provider} API key loaded")
     else:
-        st.warning("⚠️ API key required")
+        st.warning(f"⚠️ {api_provider} API key required")
 
     st.divider()
     st.subheader("📚 Batch Metadata")
@@ -266,7 +301,7 @@ ready = (
 if not ready:
     missing = []
     if not uploaded_file: missing.append("Excel file")
-    if not st.session_state.get("api_key", "").strip(): missing.append("Mistral API key")
+    if not st.session_state.get("api_key", "").strip(): missing.append(f"{st.session_state.get('api_provider', 'Mistral')} API key")
     if not st.session_state.get("chapter_name", "").strip(): missing.append("Chapter Name")
     if not st.session_state.get("chapter_code", "").strip(): missing.append("Chapter Code")
     if missing:
@@ -320,7 +355,8 @@ if ready:
                 excel_file=uploaded_file,
                 api_key=st.session_state.get("api_key", "").strip(),
                 batch_meta=batch_meta,
-                progress_callback=progress_cb
+                progress_callback=progress_cb,
+                api_provider=st.session_state.get("api_provider", "Mistral")
             )
             progress_bar.progress(1.0, text="✅ Pipeline complete!")
             status_placeholder.empty()

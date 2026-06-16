@@ -172,7 +172,7 @@ def load_curriculum_framework(framework_path="Final_Class 6_Science_Mastery Fram
         print(f"Error loading framework: {e}")
         return []
 
-def analyze_curriculum_alignment(uploaded_file, api_key: str):
+def analyze_curriculum_alignment(uploaded_file, api_key: str, api_provider: str = "Mistral"):
     """
     Analyzes the uploaded question bank spreadsheet and queries the framework/blueprint.
     Returns a dictionary of alignment fields and starting sequence number.
@@ -396,7 +396,6 @@ def analyze_curriculum_alignment(uploaded_file, api_key: str):
                 for s_idx, stem in enumerate(sample_stems[:3], start=1):
                     sample_stems_text += f"{s_idx}. {stem}\n"
 
-                client = Mistral(api_key=api_key)
                 system_prompt = (
                     "You are a curriculum mapping expert. Your task is to match an assessment topic and its sample questions "
                     "to the correct Indian NCF 2023 Grade 6 Science curriculum framework entry, and suggest code mappings.\n\n"
@@ -420,17 +419,33 @@ def analyze_curriculum_alignment(uploaded_file, api_key: str):
                     "}"
                 )
                 
-                response = client.chat.complete(
-                    model="mistral-large-latest",
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": "Please suggest matched framework entry index and codes."}
-                    ],
-                    temperature=0.1,
-                    response_format={"type": "json_object"}
-                )
-                
-                content = response.choices[0].message.content.strip()
+                if api_provider.lower() == "mistral":
+                    client = Mistral(api_key=api_key)
+                    response = client.chat.complete(
+                        model="mistral-large-latest",
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": "Please suggest matched framework entry index and codes."}
+                        ],
+                        temperature=0.1,
+                        response_format={"type": "json_object"}
+                    )
+                    content = response.choices[0].message.content.strip()
+                elif api_provider.lower() == "groq":
+                    from groq import Groq
+                    client = Groq(api_key=api_key)
+                    response = client.chat.completions.create(
+                        model="llama-3.3-70b-versatile",
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": "Please suggest matched framework entry index and codes."}
+                        ],
+                        temperature=0.1,
+                        response_format={"type": "json_object"}
+                    )
+                    content = response.choices[0].message.content.strip()
+                else:
+                    raise ValueError(f"Unknown API provider: {api_provider}")
                 import json
                 cleaned = content
                 if cleaned.startswith("```"):

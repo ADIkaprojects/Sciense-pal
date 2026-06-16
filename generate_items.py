@@ -145,6 +145,18 @@ def get_mistral_client(api_key: str):
     except Exception:
         return None
 
+def get_ai_client(api_key: str, api_provider: str = "Mistral"):
+    if api_key.lower() in ("mock", "test", ""):
+        return None
+    try:
+        if api_provider.lower() == "mistral":
+            return Mistral(api_key=api_key)
+        elif api_provider.lower() == "groq":
+            from groq import Groq
+            return Groq(api_key=api_key)
+    except Exception:
+        return None
+
 # ─── XML HELPERS FOR DOCX FORMATTING ──────────────────────────────────────────
 def set_cell_shading(cell, color_hex):
     tcPr = cell._tc.get_or_add_tcPr()
@@ -318,22 +330,40 @@ def clean_and_parse_json(text: str):
 # ─── MISTRAL API AND RETRY SYSTEM ──────────────────────────────────────────────
 def call_mistral(client, system_prompt, user_message, max_tokens=600, use_json=True, retries=3):
     if client is None:
-        raise ValueError("Mistral client not initialized (Mock Mode)")
+        raise ValueError("Client not initialized (Mock Mode)")
         
     last_err = None
+    client_type = client.__class__.__name__
+    
     for attempt in range(retries):
         try:
-            response = client.chat.complete(
-                model=MODEL,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message}
-                ],
-                temperature=0.1,
-                max_tokens=max_tokens,
-                response_format={"type": "json_object"} if use_json else None
-            )
-            content = response.choices[0].message.content
+            if client_type == "Mistral":
+                response = client.chat.complete(
+                    model="mistral-large-latest",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_message}
+                    ],
+                    temperature=0.1,
+                    max_tokens=max_tokens,
+                    response_format={"type": "json_object"} if use_json else None
+                )
+                content = response.choices[0].message.content
+            elif client_type == "Groq":
+                response = client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_message}
+                    ],
+                    temperature=0.1,
+                    max_tokens=max_tokens,
+                    response_format={"type": "json_object"} if use_json else None
+                )
+                content = response.choices[0].message.content
+            else:
+                raise ValueError(f"Unknown client type: {client_type}")
+                
             if use_json:
                 return clean_and_parse_json(content)
             else:
@@ -366,15 +396,23 @@ def generate_mock_mastery(row, inferred_type):
     }
 
 def generate_mock_format_fields(row, item_type):
-    stimulus = str(row.get("Stimulus_Text") or "").lower()
-    stem = str(row.get("Item_Stem") or "").lower()
-    combined = stimulus + " " + stem
-    
-    has_image = "Yes" if any(w in combined for w in ["image", "diagram", "figure", "picture", "photo", "saucer", "spoon"]) else "No"
-    has_table = "Yes" if any(w in combined for w in ["table", "data table", "grid", "rows", "columns"]) else "No"
+    stimulus = str(row.get("Stimulus_Text") or "")
+    stem = str(row.get("Item_Stem") or "")
+    combined = (stimulus + " " + stem).lower()
+
+    # Detect image: keywords OR actual image filenames (e.g. img1_chp10.png)
+    img_keyword = any(w in combined for w in ["image", "diagram", "figure", "picture", "photo"])
+    img_filename = bool(re.search(r'\b[\w][\w.\-]*\.(?:png|jpg|jpeg|gif|svg|webp|bmp)\b', combined, re.IGNORECASE))
+    has_image = "Yes" if img_keyword or img_filename else "No"
+
+    # Detect table: matching table patterns (Column A/B) OR table keywords
+    table_match = bool(re.search(r'(column\s+[ab]|match\s+the\s+following|col\s+[ab])', combined, re.IGNORECASE))
+    table_keyword = any(w in combined for w in ["table", "data table", "grid"])
+    has_table = "Yes" if table_match or table_keyword else "No"
+
     has_equation = "Yes" if any(w in combined for w in ["h2o", "co2", "formula", "equation", "°c", "m/s", "f=ma"]) else "No"
     eq_format = "LaTeX" if has_equation == "Yes" else "N/A"
-    
+
     return {
         "has_image": has_image,
         "has_table": has_table,
@@ -390,14 +428,26 @@ def generate_mock_rationales(row, correct_letter, chapter_name="Science"):
         "C": str(row.get("Option_C") or ""),
         "D": str(row.get("Option_D") or "")
     }
-    
+    # Provide a sequential mock error type so each distractor gets a distinct label
+    error_types = ["Conceptual error", "Procedural error", "Comprehension error"]
+    error_idx = 0
+
     rationales = {}
     for letter, text in opts.items():
         if letter == correct_letter:
-            rationales[f"rationale_{letter.lower()}"] = f"CORRECT ANSWER: {text} is correct because it represents the accurate scientific concept for {chapter_name}."
+            rationales[f"rationale_{letter.lower()}"] = (
+                f"CORRECT ANSWER: {text} correctly identifies the scientific concept "
+                f"being assessed. This option reflects an accurate understanding of the "
+                f"process or classification described in the question stem."
+            )
         else:
-            rationales[f"rationale_{letter.lower()}"] = f"Misconception or category confusion: The learner selected '{text}' because they confused this concept with another related scientific idea in {chapter_name}."
-            
+            error_type = error_types[error_idx % len(error_types)]
+            error_idx += 1
+            rationales[f"rationale_{letter.lower()}"] = (
+                f"{error_type}: The learner selects '{text}' due to incomplete understanding "
+                f"of the concept tested, applying a related but incorrect idea to the scenario."
+            )
+
     return rationales
 
 def generate_mock_explanation(row, item_type, correct_letter, rationales, chapter_name="Science"):
@@ -408,48 +458,119 @@ def generate_mock_explanation(row, item_type, correct_letter, rationales, chapte
         "C": str(row.get("Option_C") or ""),
         "D": str(row.get("Option_D") or "")
     }
-    
+
     if item_type == "MCQ":
         correct_text = opts.get(correct_letter, "")
-        explanation = f"The correct answer is {correct_letter}. {correct_text}.\n\nThis is correct because it matches the concepts required by the question stem in the study of {chapter_name}.\n\nWhy other options are incorrect:\n\n"
+        # Required format: state the correct answer first (exact phrase)
+        explanation = f"The correct answer is {correct_letter}. {correct_text}.\n\n"
+        # Brief, accessible explanation of the concept behind the correct answer
+        explanation += (
+            "This option is correct because it accurately reflects the scientific concept "
+            "being assessed. Understanding this idea helps you connect the topic to what "
+            "you have learnt in class.\n\n"
+        )
+        # Required heading (exact phrase)
+        explanation += "Why other options are incorrect:\n\n"
+        # Per incorrect option in exact required format
         for letter in ["A", "B", "C", "D"]:
             if letter != correct_letter:
                 text = opts.get(letter, "")
-                explanation += f"Option {letter} ({text}) is incorrect because it describes a different stage, process, or concept that does not solve the task described in the stem.\n\n"
+                rat = rationales.get(f"rationale_{letter.lower()}", "")
+                # Strip error-type prefix for kid-friendly language, avoid double stops
+                if ": " in rat and not rat.startswith("CORRECT"):
+                    reason = rat.split(": ", 1)[1].rstrip(".")
+                else:
+                    reason = rat.rstrip(".")
+                explanation += f"Option {letter} ({text}) is incorrect because {reason}.\n\n"
         return explanation.strip()
     else:
+        # Constructed response: single cohesive paragraph applied to scenario
         ans = str(row.get("Correct_Answer") or "")
-        return f"The model answer is: {ans}.\n\nThis is correct because the concepts match the scientific requirements of the scenario in {chapter_name}. Students who answer partially are likely to identify only one relevant factor while ignoring others."
+        scenario_ref = stem[:80].rstrip() if stem else "the scenario described in the question"
+        return (
+            f"{ans if ans else 'The correct response accurately addresses the scientific concept described in the question.'} "
+            f"Applying this understanding to {scenario_ref} explains both the process involved "
+            f"and the outcome described. Students who only partially answer this question may "
+            f"identify one relevant factor but fail to connect it fully to the specific "
+            f"situation described."
+        )
 
 def generate_mock_rubric(row, max_score, chapter_name="Science"):
-    stem = str(row.get("Item_Stem") or "")
     ans = str(row.get("Correct_Answer") or "")
-    
-    sample_ans = ans if ans else "The correct explanation based on the scientific concepts."
-    
+
     rows = []
     if max_score == 2:
         rows = [
-            {"score": 2, "label": "Full marks", "criteria": f"Student correctly explains both key scientific aspects related to {chapter_name}.", "sample": sample_ans},
-            {"score": 1, "label": "Partial marks", "criteria": "Student explains only one scientific aspect or fails to provide full reasoning.", "sample": "Identified the basic idea but missed the detailed scientific reason."},
-            {"score": 0, "label": "Zero", "criteria": "Student gives an incorrect, off-topic, or misconception-based response.", "sample": "Gave an explanation that is not scientifically relevant."}
+            {
+                "score": 2,
+                "label": "Full marks",
+                "criteria": (
+                    "Student correctly identifies both key scientific concepts and demonstrates "
+                    "understanding of their relationship, using appropriate scientific language."
+                ),
+                "sample": (
+                    f"\"{ans if ans else 'The process happens because of the two factors described in the question, and without either one, the outcome changes.'}\""
+                )
+            },
+            {
+                "score": 1,
+                "label": "Partial marks",
+                "criteria": (
+                    "Student correctly identifies one key concept OR identifies both concepts "
+                    "but uses informal or imprecise language."
+                ),
+                "sample": "\"The process happens because of one of the main factors.\""
+            },
+            {
+                "score": 0,
+                "label": "Zero",
+                "criteria": (
+                    "Irrelevant answer, fundamental misconception, or purely observational "
+                    "response with no scientific reasoning."
+                ),
+                "sample": "\"The process does not depend on any factors and happens by itself.\""
+            }
         ]
-    elif max_score == 3:
+    else:  # max_score == 3 or fallback
         rows = [
-            {"score": 3, "label": "Full marks", "criteria": f"Student applies concepts to the scenario with a fully justified explanation and correct terminology for {chapter_name}.", "sample": sample_ans},
-            {"score": 2, "label": "Substantial", "criteria": "Student provides the correct outcome with mostly complete reasoning.", "sample": "Gave the correct explanation but with minor terminology gaps."},
-            {"score": 1, "label": "Basic", "criteria": "Student recognizes the basic concept but cannot describe details or reasoning correctly.", "sample": "Stated the final outcome without explaining why it happened."},
-            {"score": 0, "label": "Zero", "criteria": "Student gives an incorrect or misconception-based response.", "sample": "Answered based on common misconceptions."}
+            {
+                "score": 3,
+                "label": "Full marks",
+                "criteria": (
+                    "Student correctly applies the relevant concept(s) to the scenario, "
+                    "accurately predicts or explains the outcome, uses precise scientific "
+                    "terminology, and demonstrates clear logical reasoning with no conceptual errors."
+                ),
+                "sample": (
+                    f"\"{ans if ans else 'The scientific concept directly explains the outcome described in the scenario, as demonstrated by the clear process.'}\""
+                )
+            },
+            {
+                "score": 2,
+                "label": "Partial",
+                "criteria": (
+                    "Correctly applies main concept(s) with minor omissions; correct outcome "
+                    "stated with mostly complete reasoning; accurate in 2 of 3 required elements."
+                ),
+                "sample": "\"The process happens because of the main factor, but the connection is unclear.\""
+            },
+            {
+                "score": 1,
+                "label": "Minimal",
+                "criteria": (
+                    "Some relevant scientific understanding shown but concept applied incorrectly "
+                    "or partially; OR correct outcome stated without reasoning."
+                ),
+                "sample": "\"It happens because of this factor.\""
+            },
+            {
+                "score": 0,
+                "label": "Zero",
+                "criteria": "Irrelevant, fundamentally incorrect, or blank.",
+                "sample": "\"Nothing will happen because the process does not depend on these things.\""
+            }
         ]
-    else: # max_score == 4 or fallback
-        rows = [
-            {"score": 4, "label": "Full marks", "criteria": f"Student evaluates the scientific scenario comprehensively, identifies the reasoning flaw, and corrects it with appropriate properties of {chapter_name}.", "sample": sample_ans},
-            {"score": 3, "label": "Strong partial", "criteria": "Student identifies the flaw/error and corrects it with one property justified.", "sample": "Identified the main scientific error and corrected it, but lacked detail on the second property."},
-            {"score": 2, "label": "Moderate partial", "criteria": "Student states what failed practically without framing as a scientific reasoning flaw.", "sample": "Stated the practical outcome without explaining the underlying scientific reason."},
-            {"score": 1, "label": "Minimal", "criteria": "Student names a property or concept but has no explanation.", "sample": "Mentioned the relevant term but did not explain it."},
-            {"score": 0, "label": "Zero", "criteria": "Student defends the incorrect claim or gives irrelevant responses.", "sample": "Defended the incorrect reasoning."}
-        ]
-        
+
     return {"rows": rows}
 
 def get_matching_chapter_in_science_excel(selected_chap, excel_chapters):
@@ -635,7 +756,7 @@ def compute_lo_id(combo, unique_combos):
     return f"LO-{comp_num}.{suffix_letter}"
 
 # ─── CORE PIPELINE RUNNER ─────────────────────────────────────────────────────
-def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
+def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback, api_provider: str = "Mistral"):
     """
     Ingests, validates, enriches and generates DOCX and CSV log.
     Returns: docx_bytes, csv_bytes, summary_dict
@@ -700,6 +821,38 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
         
     unique_combos = load_curriculum_framework(framework_path)
     
+    import difflib
+    
+    file_name_topic = None
+    file_name_topic_id = None
+    file_name_chapter_id = None
+    best_ratio = 0
+    
+    if hasattr(excel_file, "name"):
+        base_name = os.path.splitext(os.path.basename(excel_file.name))[0]
+        base_name_clean = re.sub(r'[^a-zA-Z0-9\s]', ' ', base_name).strip().lower()
+        
+        # Match against all unique topics for 6th grade
+        all_topics_df = df_science[['Topic ID', 'Topic', 'Chapter ID']].drop_duplicates()
+        for _, r in all_topics_df.iterrows():
+            t_name = str(r['Topic'])
+            t_clean = re.sub(r'[^a-zA-Z0-9\s]', ' ', t_name).strip().lower()
+            
+            # Exact or substring match gets priority 1.0
+            if t_clean in base_name_clean or base_name_clean in t_clean:
+                ratio = 1.0
+            else:
+                ratio = difflib.SequenceMatcher(None, base_name_clean, t_clean).ratio()
+                
+            if ratio >= 0.4 and ratio > best_ratio:
+                best_ratio = ratio
+                file_name_topic = t_name
+                file_name_topic_id = r['Topic ID']
+                file_name_chapter_id = r['Chapter ID']
+                
+    if file_name_chapter_id:
+        chapter_id = str(file_name_chapter_id).strip()
+
     # Track sequence number per topic ID
     current_seq = {}
 
@@ -773,7 +926,7 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
     
     audit_logs = []
     
-    client = get_mistral_client(api_key)
+    client = get_ai_client(api_key, api_provider)
     is_mock = client is None
     
     for idx, row in enumerate(raw_rows):
@@ -892,9 +1045,13 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
         correct_ans = str(row.get("Correct_Answer") or "").strip()
         
         # ─── TOPIC CLASSIFICATION & ALIGNMENT ─────────────────────────────────
-        pt = classify_topic_with_ai(client, stem, stimulus, predefined_topics, row_topic=topic)
-        item_topic = pt['Topic']
-        item_topic_id = pt['Topic ID']
+        if file_name_topic:
+            item_topic = file_name_topic
+            item_topic_id = file_name_topic_id
+        else:
+            pt = classify_topic_with_ai(client, stem, stimulus, predefined_topics, row_topic=topic)
+            item_topic = pt['Topic']
+            item_topic_id = pt['Topic ID']
         
         combo = get_framework_alignment_for_topic(item_topic, matched_chapter, unique_combos)
         if combo:
@@ -937,57 +1094,60 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
         confirmed_mastery = "M2" # Fallback default
         override_msg = ""
         
-        if is_mock:
-            c1_res = generate_mock_mastery(row, inferred_item_type)
+        if mastery_excel in ("M1", "M2", "M3", "M4"):
+            confirmed_mastery = mastery_excel
         else:
-            try:
-                system_prompt_c1 = (
-                    "You are an expert assessment designer for the NCF 2023 Grade 6 Science curriculum in India.\n"
-                    "You classify assessment items into one of four Mastery Levels based strictly on the cognitive\n"
-                    "demand required to answer correctly — not on topic difficulty.\n\n"
-                    "MASTERY LEVEL DEFINITIONS:\n\n"
-                    "M1 (Remembering, DoK 1):\n"
-                    "  The learner identifies, names, or recognises from a given set. No explanation required.\n"
-                    "  Direct recall or recognition. ALWAYS MCQ or matching format.\n\n"
-                    "M2 (Understanding, DoK 2):\n"
-                    "  The learner explains, classifies, or describes using scientific reasoning in a familiar,\n"
-                    "  structured context. Requires understanding, not just recall. MCQ with justification or Short Answer.\n\n"
-                    "M3 (Applying, DoK 3):\n"
-                    "  The learner solves an unfamiliar scenario, applies knowledge to a novel situation, or reasons\n"
-                    "  through a non-obvious case. The stimulus introduces context not directly taught.\n"
-                    "  Can be scenario-based MCQ or Short Answer / Extended Response.\n\n"
-                    "M4 (Evaluating, DoK 3+):\n"
-                    "  The learner evaluates a flawed claim, incorrect reasoning, or competing explanation in the stimulus,\n"
-                    "  identifies the specific error in REASONING (not just facts), and constructs a justified correction.\n"
-                    "  ALWAYS Extended Response. The flaw must be in the reasoning, not just the outcome.\n\n"
-                    "CLASSIFICATION RULES:\n"
-                    "1. Base classification on the cognitive demand of STEM + STIMULUS together, not topic difficulty.\n"
-                    "2. An item answerable purely from memory → M1 or M2, never M3 or M4.\n"
-                    "3. M3 requires an unfamiliar scenario; applying knowledge in a familiar context → M2.\n"
-                    "4. M4 REQUIRES a flawed reasoning claim in the stimulus. No flaw → cannot be M4.\n"
-                    "5. If operator supplied a Mastery_Level, validate it. If incorrect, override and explain.\n\n"
-                    "OUTPUT: JSON only, no other text:\n"
-                    '{"mastery_level": "M1", "reasoning": "One sentence justifying the classification.", "operator_override": false}'
-                )
+            if is_mock:
+                c1_res = generate_mock_mastery(row, inferred_item_type)
+            else:
+                try:
+                    system_prompt_c1 = (
+                        "You are an expert assessment designer for the NCF 2023 Grade 6 Science curriculum in India.\n"
+                        "You classify assessment items into one of four Mastery Levels based strictly on the cognitive\n"
+                        "demand required to answer correctly — not on topic difficulty.\n\n"
+                        "MASTERY LEVEL DEFINITIONS:\n\n"
+                        "M1 (Remembering, DoK 1):\n"
+                        "  The learner identifies, names, or recognises from a given set. No explanation required.\n"
+                        "  Direct recall or recognition. ALWAYS MCQ or matching format.\n\n"
+                        "M2 (Understanding, DoK 2):\n"
+                        "  The learner explains, classifies, or describes using scientific reasoning in a familiar,\n"
+                        "  structured context. Requires understanding, not just recall. MCQ with justification or Short Answer.\n\n"
+                        "M3 (Applying, DoK 3):\n"
+                        "  The learner solves an unfamiliar scenario, applies knowledge to a novel situation, or reasons\n"
+                        "  through a non-obvious case. The stimulus introduces context not directly taught.\n"
+                        "  Can be scenario-based MCQ or Short Answer / Extended Response.\n\n"
+                        "M4 (Evaluating, DoK 4 — Extended Thinking):\n"
+                        "  The learner evaluates a flawed claim, incorrect reasoning, or competing explanation in the stimulus,\n"
+                        "  identifies the specific error in REASONING (not just facts), and constructs a justified correction.\n"
+                        "  ALWAYS Extended Response. The flaw must be in the reasoning, not just the outcome.\n\n"
+                        "CLASSIFICATION RULES:\n"
+                        "1. Base classification on the cognitive demand of STEM + STIMULUS together, not topic difficulty.\n"
+                        "2. An item answerable purely from memory → M1 or M2, never M3 or M4.\n"
+                        "3. M3 requires an unfamiliar scenario; applying knowledge in a familiar context → M2.\n"
+                        "4. M4 REQUIRES a flawed reasoning claim in the stimulus. No flaw → cannot be M4.\n"
+                        "5. If operator supplied a Mastery_Level, validate it. If incorrect, override and explain.\n\n"
+                        "OUTPUT: JSON only, no other text:\n"
+                        '{"mastery_level": "M1", "reasoning": "One sentence justifying the classification.", "operator_override": false}'
+                    )
+                    
+                    correct_ans_sum = row["Correct_Option"] if inferred_item_type == "MCQ" else row["Correct_Answer"]
+                    user_msg_c1 = (
+                        f"Item Type (inferred): {inferred_item_type}\n"
+                        f"Operator-supplied Mastery Level: {mastery_excel if mastery_excel else 'Not provided — please classify.'}\n"
+                        f"Stimulus: {stimulus if stimulus else 'None'}\n"
+                        f"Item Stem: {stem}\n"
+                        f"Correct Answer / Option: {correct_ans_sum}"
+                    )
+                    
+                    c1_res = call_mistral(client, system_prompt_c1, user_msg_c1, max_tokens=150, use_json=True)
+                except Exception as exc:
+                    fallback_level = mastery_excel if mastery_excel in ("M1", "M2", "M3", "M4") else "M2"
+                    c1_res = {"mastery_level": fallback_level, "reasoning": f"Fallback to {fallback_level} due to API error: {exc}", "operator_override": False}
+                    
+            confirmed_mastery = c1_res.get("mastery_level", "M2").upper()
+            if confirmed_mastery not in ("M1", "M2", "M3", "M4"):
+                confirmed_mastery = "M2"
                 
-                correct_ans_sum = row["Correct_Option"] if inferred_item_type == "MCQ" else row["Correct_Answer"]
-                user_msg_c1 = (
-                    f"Item Type (inferred): {inferred_item_type}\n"
-                    f"Operator-supplied Mastery Level: {mastery_excel if mastery_excel else 'Not provided — please classify.'}\n"
-                    f"Stimulus: {stimulus if stimulus else 'None'}\n"
-                    f"Item Stem: {stem}\n"
-                    f"Correct Answer / Option: {correct_ans_sum}"
-                )
-                
-                c1_res = call_mistral(client, system_prompt_c1, user_msg_c1, max_tokens=150, use_json=True)
-            except Exception as exc:
-                fallback_level = mastery_excel if mastery_excel in ("M1", "M2", "M3", "M4") else "M2"
-                c1_res = {"mastery_level": fallback_level, "reasoning": f"Fallback to {fallback_level} due to API error: {exc}", "operator_override": False}
-                
-        confirmed_mastery = c1_res.get("mastery_level", "M2").upper()
-        if confirmed_mastery not in ("M1", "M2", "M3", "M4"):
-            confirmed_mastery = "M2"
-            
         if mastery_excel and confirmed_mastery != mastery_excel:
             override_msg = f"Override: Operator suggested {mastery_excel}, AI classified as {confirmed_mastery}."
             override_count += 1
@@ -1024,7 +1184,7 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
         # ─── CALL 2: FORMAT FIELD INFERENCE ──────────────────────────────────
         if progress_callback:
             progress_callback(i + 1, total_valid, item_id, confirmed_mastery, "Inferring rendering properties...")
-            
+
         if is_mock:
             c2_res = generate_mock_format_fields(row, item_type)
         else:
@@ -1033,17 +1193,21 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
                     "You are a technical data-entry assistant for an educational assessment platform.\n"
                     "Analyse the item content and determine its rendering properties.\n\n"
                     "Has_Image:\n"
-                    "  YES if stimulus or stem explicitly references an image, photograph, diagram, figure, picture,\n"
-                    "  or contains image description text (e.g., 'Image description: ...'). NO otherwise.\n\n"
+                    "  YES if stimulus or stem references an image, photograph, diagram, figure, picture,\n"
+                    "  OR contains any image filename (e.g., 'img1_chp10.png', 'figure_2.jpg'),\n"
+                    "  OR contains phrases like 'the diagram below', 'the figure above', 'look at the image'.\n"
+                    "  NO otherwise.\n\n"
                     "Has_Table:\n"
-                    "  YES if stimulus or stem contains a data table or references tabular data explicitly. NO otherwise.\n\n"
+                    "  YES if stimulus or stem contains a data table, matching table (Column A / Column B),\n"
+                    "  'match the following', grid, or any explicit reference to tabular data.\n"
+                    "  NO otherwise.\n\n"
                     "Has_Equation:\n"
-                    "  YES if the item contains mathematical symbols, chemical formulae, physical quantities in symbolic form\n"
-                    "  (e.g., H₂O, CO₂, 37°C, m/s², F=ma), or scientific notation requiring special rendering.\n"
-                    "  NO for plain-text descriptions of formulae.\n\n"
+                    "  YES if the item contains mathematical symbols, chemical formulae, physical quantities\n"
+                    "  in symbolic form (e.g., H₂O, CO₂, 37°C, m/s², F=ma), or scientific notation.\n"
+                    "  NO for plain-text descriptions.\n\n"
                     "Equation_Format:\n"
-                    "  If Has_Equation is YES → 'LaTeX' if expressible cleanly in LaTeX; 'Image' if it requires\n"
-                    "  a diagram or complex visual. 'N/A' if Has_Equation is NO.\n\n"
+                    "  If Has_Equation is YES → 'LaTeX' if cleanly LaTeX-expressible; 'Image' if a visual\n"
+                    "  is needed. 'N/A' if Has_Equation is NO.\n\n"
                     "OUTPUT: JSON only, no other text:\n"
                     '{"has_image": "Yes", "has_table": "No", "has_equation": "No", "equation_format": "N/A"}'
                 )
@@ -1058,13 +1222,49 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
                 c2_res = call_mistral(client, system_prompt_c2, user_msg_c2, max_tokens=120, use_json=True)
             except Exception as exc:
                 c2_res = {"has_image": "No", "has_table": "No", "has_equation": "No", "equation_format": "N/A"}
-                
+
         has_image = str(c2_res.get("has_image", "No")).strip().capitalize()
         if row.get("_images"):
             has_image = "Yes"
         has_table = str(c2_res.get("has_table", "No")).strip().capitalize()
         has_equation = str(c2_res.get("has_equation", "No")).strip().capitalize()
-        
+
+        # ─── POST-PROCESS: Detect image filenames embedded in stem/stimulus ───
+        # e.g. "img1_chp10.png", "figure_3.jpg" → extract, mark Has_Image=Yes,
+        # and remove the raw filename from the stem (per delivery checklist).
+        IMG_FILENAME_RE = re.compile(
+            r'\b([\w][\w.\-]*\.(?:png|jpg|jpeg|gif|svg|webp|bmp))\b',
+            re.IGNORECASE
+        )
+        detected_image_filename = None
+        all_img_filenames = IMG_FILENAME_RE.findall(stem) + IMG_FILENAME_RE.findall(stimulus)
+        if all_img_filenames:
+            has_image = "Yes"
+            detected_image_filename = all_img_filenames[0]
+            # Remove bare filenames from stem (leave surrounding context intact)
+            for fn in IMG_FILENAME_RE.findall(stem):
+                stem = re.sub(
+                    r'[\(\[\s]*' + re.escape(fn) + r'[\)\]\s]*',
+                    ' ', stem
+                ).strip()
+            stem = re.sub(r'\s{2,}', ' ', stem).strip()
+
+        # ─── POST-PROCESS: Detect matching-table patterns ─────────────────────
+        TABLE_DETECT_RE = re.compile(
+            r'(column\s+[ab]|match\s+the\s+following|col\s+[ab]|column\s+[12])',
+            re.IGNORECASE
+        )
+        if TABLE_DETECT_RE.search(stem + " " + (stimulus or "")):
+            has_table = "Yes"
+
+        # ─── Resolve Image_File_Name ──────────────────────────────────────────
+        if detected_image_filename:
+            image_file_name = detected_image_filename
+        elif has_image == "Yes":
+            image_file_name = f"{item_id}-img01.png"
+        else:
+            image_file_name = ""
+
         # Clean up eq_format to be LaTeX or Image if Has_Equation is Yes, else blank
         eq_format_raw = str(c2_res.get("equation_format", "")).strip()
         if has_equation == "Yes":
@@ -1073,7 +1273,7 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
             elif "image" in eq_format_raw.lower():
                 eq_format = "Image"
             else:
-                eq_format = "LaTeX" # default fallback
+                eq_format = "LaTeX"  # default fallback
         else:
             eq_format = ""
         
@@ -1082,23 +1282,50 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
         if item_type == "MCQ":
             if progress_callback:
                 progress_callback(i + 1, total_valid, item_id, confirmed_mastery, "Generating distractor rationales...")
-                
+
             if is_mock:
                 distractor_rationales = generate_mock_rationales(row, correct_opt, chapter_name=matched_chapter)
             else:
                 try:
                     system_prompt_c3 = (
-                        "You are an expert assessment designer specialising in Grade 6 Science for the NCF 2023\n"
-                        "curriculum in India. You write distractor rationales that explain the specific misconception\n"
-                        "a learner must hold in order to choose a wrong MCQ option.\n\n"
-                        "A strong distractor rationale:\n"
-                        "  - Names the specific misconception (e.g., 'cross-category confusion,' 'within-category\n"
-                        "    opposite,' 'overgeneralisation of a rule')\n"
-                        "  - Explains the cognitive error in concrete terms\n"
-                        "  - Is 1–2 sentences maximum\n"
-                        "  - Is written for the item author, not the student\n\n"
-                        "For the CORRECT answer, write 1 sentence beginning with 'CORRECT ANSWER:' that briefly\n"
-                        "explains why it is correct.\n\n"
+                        "You are an expert assessment designer for Grade 6 Science (NCF 2023, India).\n"
+                        "Your task is to write DIAGNOSTIC OPTION RATIONALES for an MCQ.\n\n"
+                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        "DIAGNOSTIC OPTION RATIONALE GUIDELINES\n"
+                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        "For every MCQ, provide a specific, diagnostic rationale for ALL FOUR options.\n"
+                        "Base your analysis on the exact scientific concepts tested and how a\n"
+                        "6th-grade learner thinks about this specific topic.\n\n"
+                        "1. CORRECT OPTION:\n"
+                        "   Always begin with exactly: CORRECT ANSWER:\n"
+                        "   Provide a clear, direct scientific explanation of why this option is correct.\n"
+                        "   Be specific to the concept in this item — do NOT give a generic explanation.\n\n"
+                        "2. INCORRECT OPTIONS (Distractors):\n"
+                        "   Identify the exact cognitive misstep the learner made.\n"
+                        "   Start with ONE of these three error types (exactly as written), followed by\n"
+                        "   a colon, then explain the specific flawed thinking:\n\n"
+                        "   Conceptual error: Errors due to misconceptions or factual errors. Stems from\n"
+                        "     partial understanding or confusion between related concepts.\n"
+                        "     Example: 'Conceptual error: Learner places leaves before germination,\n"
+                        "     confusing when a seed first sprouts with later leaf growth.'\n\n"
+                        "   Procedural error: Errors from incorrect application of a process or\n"
+                        "     step-by-step observation. Used mainly for application/scenario questions.\n"
+                        "     Example: 'Procedural error: Learner reverses the germination steps,\n"
+                        "     placing root emergence after shoot appearance.'\n\n"
+                        "   Comprehension error: Errors from misreading or misinterpreting the question\n"
+                        "     language or a specific term/phrase in the stem.\n"
+                        "     Example: 'Comprehension error: Learner reads \"next stage\" as referring to\n"
+                        "     the mature plant rather than the immediate developmental step.'\n\n"
+                        "CRITICAL RULES — VIOLATIONS WILL CAUSE REJECTION:\n"
+                        "  ✗ NEVER write 'confused this concept with another related scientific idea'\n"
+                        "  ✗ NEVER reference the chapter title (e.g., 'Living Creatures: Exploring their\n"
+                        "    Characteristics') — reference the SPECIFIC concept being assessed instead\n"
+                        "    (e.g., 'germination conditions', 'life cycle of a bean plant',\n"
+                        "    'flower-to-pod/fruit formation')\n"
+                        "  ✗ NEVER write generic rationales that could apply to any question\n"
+                        "  ✓ ALWAYS name the exact misconception specific to this item\n"
+                        "  ✓ Maximum 1-2 sentences per rationale\n"
+                        "  ✓ Written for the item author, not the student\n\n"
                         "OUTPUT: JSON only, no other text:\n"
                         '{\n'
                         '  "rationale_a": "...",\n'
@@ -1107,61 +1334,94 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
                         '  "rationale_d": "..."\n'
                         '}'
                     )
-                    
+
                     user_msg_c3 = (
                         f"Topic: {topic}\n"
+                        f"Stimulus: {stimulus if stimulus else 'None'}\n"
                         f"Item Stem: {stem}\n"
                         f"Option A: {row.get('Option_A')} (Correct: {'Yes' if correct_opt == 'A' else 'No'})\n"
                         f"Option B: {row.get('Option_B')} (Correct: {'Yes' if correct_opt == 'B' else 'No'})\n"
                         f"Option C: {row.get('Option_C')} (Correct: {'Yes' if correct_opt == 'C' else 'No'})\n"
-                        f"Option D: {row.get('Option_D')} (Correct: {'Yes' if correct_opt == 'D' else 'No'})\n"
+                        f"Option D: {row.get('Option_D')} (Correct: {'Yes' if correct_opt == 'D' else 'No'})\n\n"
+                        "Write rationales that are SPECIFIC to this exact question. "
+                        "For each wrong option, name the exact misconception a Grade 6 learner "
+                        "would hold that makes that option attractive. Do NOT use generic phrases."
                     )
-                    
-                    distractor_rationales = call_mistral(client, system_prompt_c3, user_msg_c3, max_tokens=600, use_json=True)
+
+                    distractor_rationales = call_mistral(client, system_prompt_c3, user_msg_c3, max_tokens=800, use_json=True)
                 except Exception:
-                    # Fallback manually
                     distractor_rationales = generate_mock_rationales(row, correct_opt, chapter_name=matched_chapter)
-                    
+
         # ─── CALL 4: ANSWER EXPLANATION GENERATION ────────────────────────────
         if progress_callback:
             progress_callback(i + 1, total_valid, item_id, confirmed_mastery, "Generating answer explanation...")
-            
+
         if is_mock:
             explanation_text = generate_mock_explanation(row, item_type, correct_opt, distractor_rationales, chapter_name=matched_chapter)
         else:
             try:
                 system_prompt_c4 = (
-                    "You are a science teacher for Grade 6 students (approximately 11-year-olds) in India,\n"
-                    "writing feedback that will be shown on an educational platform.\n\n"
-                    "Your explanation must be:\n"
-                    "  - Clear and accessible for Grade 6 students (short sentences, everyday analogies where helpful)\n"
-                    "  - Scientifically accurate and aligned with the NCF 2023 Grade 6 Science curriculum\n"
-                    "  - Complete: it must explain the correct answer AND (for MCQ) why each wrong answer is wrong\n\n"
-                    "FOR MCQ ITEMS — Required structure:\n"
-                    "  Paragraph 1: Explain the correct answer clearly (2-4 sentences).\n"
-                    "  Then add: \"Why other options are incorrect:\"\n"
-                    "  Option [letter] ([text]) is incorrect because [specific reason — name the conceptual error].\n"
-                    "  Repeat for each incorrect option.\n\n"
-                    "FOR SHORT ANSWER / EXTENDED RESPONSE — Required structure:\n"
-                    "  Paragraph explaining the model answer (2-4 sentences covering all key ideas).\n"
-                    "  Then: what students who partially answer or miss the answer are likely confusing.\n\n"
-                    "LANGUAGE: Grade 6–8 level. No jargon without explanation. Use analogies from daily life.\n\n"
-                    "OUTPUT: Plain text only. No JSON. No headers. No markdown. Just the explanation text."
+                    "You are a Grade 6 Science teacher in India writing student-facing feedback\n"
+                    "for an educational platform. Write in plain, simple, kid-friendly British English\n"
+                    "suitable for 11-to-12-year-olds.\n\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "STUDENT-FACING ANSWER EXPLANATION GUIDELINES\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    "IF THE QUESTION IS AN MCQ — use this EXACT structure (no deviations):\n"
+                    "  Step 1 — State correct answer (exact phrase required):\n"
+                    "    'The correct answer is [Option Letter]. [Full Option Text].'\n"
+                    "  Step 2 — Explain the correct answer:\n"
+                    "    Brief paragraph (2-3 sentences) explaining the scientific concept.\n"
+                    "    Apply the concept DIRECTLY to the specific scenario/question asked.\n"
+                    "    Do NOT give a generic definition. Connect it to what the question described.\n"
+                    "  Step 3 — Distractor heading (exact phrase required):\n"
+                    "    'Why other options are incorrect:'\n"
+                    "  Step 4 — Per incorrect option (exact format required):\n"
+                    "    'Option [Letter] ([Full Option Text]) is incorrect because [simple, kid-friendly\n"
+                    "    explanation of the specific misconception].'\n"
+                    "    Repeat for each incorrect option.\n\n"
+                    "IF THE QUESTION IS CONSTRUCTED RESPONSE (Short Answer / ECR) — use this structure:\n"
+                    "  Write a SINGLE cohesive paragraph.\n"
+                    "  Do NOT just state the generic scientific definition.\n"
+                    "  Apply the scientific explanation directly to the specific characters, objects,\n"
+                    "  or scenario mentioned in the question (e.g., if the question mentions Riya's\n"
+                    "  diagram, refer to Riya's diagram specifically).\n\n"
+                    "LANGUAGE RULES:\n"
+                    "  - Plain British English. Short sentences. Age 11-12.\n"
+                    "  - Scientifically accurate, NCF 2023 Grade 6 aligned.\n"
+                    "  - Everyday analogies where helpful.\n"
+                    "  - NEVER end a sentence with double full stops (..).\n"
+                    "  - NEVER reference the chapter title generically (e.g., 'Living Creatures:\n"
+                    "    Exploring their Characteristics'). Reference the specific concept instead.\n\n"
+                    "OUTPUT: Plain text only. No JSON. No markdown headers. Just the explanation text."
                 )
-                
-                correct_ans_or_opt_text = row["Correct_Option"] + ". " + str(row.get(f"Option_{correct_opt}")) if item_type == "MCQ" else row["Correct_Answer"]
-                
+
+                correct_ans_or_opt_text = (
+                    row["Correct_Option"] + ". " + str(row.get(f"Option_{correct_opt}"))
+                    if item_type == "MCQ" else row["Correct_Answer"]
+                )
+
                 user_msg_c4 = (
                     f"Item Type: {item_type}\n"
                     f"Topic: {topic}\n"
                     f"Stimulus: {stimulus if stimulus else 'None'}\n"
                     f"Item Stem: {stem}\n"
                     f"Correct Answer: {correct_ans_or_opt_text}\n"
-                    + (f"Option A: {row.get('Option_A')}\nOption B: {row.get('Option_B')}\nOption C: {row.get('Option_C')}\nOption D: {row.get('Option_D')}\n" if item_type == "MCQ" else "")
-                    + (f"Distractor rationales: {json.dumps(distractor_rationales)}" if item_type == "MCQ" else "")
+                    + (
+                        f"Option A: {row.get('Option_A')}\n"
+                        f"Option B: {row.get('Option_B')}\n"
+                        f"Option C: {row.get('Option_C')}\n"
+                        f"Option D: {row.get('Option_D')}\n"
+                        if item_type == "MCQ" else ""
+                    )
+                    + (
+                        f"Distractor rationales (use these to write the 'Why other options are "
+                        f"incorrect' section): {json.dumps(distractor_rationales)}"
+                        if item_type == "MCQ" else ""
+                    )
                 )
-                
-                explanation_text = call_mistral(client, system_prompt_c4, user_msg_c4, max_tokens=500, use_json=False)
+
+                explanation_text = call_mistral(client, system_prompt_c4, user_msg_c4, max_tokens=700, use_json=False)
             except Exception:
                 explanation_text = generate_mock_explanation(row, item_type, correct_opt, distractor_rationales, chapter_name=matched_chapter)
                 
@@ -1177,7 +1437,7 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
             "M1": "1",
             "M2": "2",
             "M3": "3",
-            "M4": "3"
+            "M4": "4"  # M4 = Evaluating + Extended Thinking
         }.get(confirmed_mastery, "2")
         
         # Est Time
@@ -1191,10 +1451,10 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
         # Max Score
         if item_type == "MCQ":
             max_score = 1
-        elif item_type == "Short Answer":
-            max_score = 2 if confirmed_mastery == "M2" else 3
-        else: # Extended Response
-            max_score = 3 if confirmed_mastery == "M3" else 4
+        elif confirmed_mastery == "M2":
+            max_score = 2
+        else: # M3 and M4
+            max_score = 3
             
         # Scoring Type
         scoring_type = "Dichotomous (0/1)" if item_type == "MCQ" else f"Polytomous (0-{max_score})"
@@ -1224,7 +1484,7 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
         if item_type != "MCQ":
             if progress_callback:
                 progress_callback(i + 1, total_valid, item_id, confirmed_mastery, "Generating marking rubric...")
-                
+
             if is_mock:
                 rubric_data = generate_mock_rubric(row, max_score, chapter_name=matched_chapter)
             else:
@@ -1233,58 +1493,61 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
                         "You are a marking rubric designer for Grade 6 Science assessments aligned to NCF 2023 India.\n"
                         "Your rubrics follow the partial-credit scoring model: binary (full or zero) marking is\n"
                         "NOT acceptable. Every rubric must have a score tier for each point from 0 to the max score.\n\n"
-                        "RUBRIC TIER DEFINITIONS (apply based on max score):\n\n"
+                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        "CRITICAL FORMATTING RULES — STRICTLY ENFORCED:\n"
+                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        "1. SAMPLE RESPONSE TONE: Write direct, confident answers that sound like a 6th-grade\n"
+                        "   student writing on a formal science test. DO NOT write conversational, childish,\n"
+                        "   or self-deprecating dialogue. BANNED PHRASES: \"I think...\", \"I don't know...\",\n"
+                        "   \"I'm not sure...\", \"It magically happens.\"\n\n"
+                        "2. INVERTED COMMAS: Every Sample Response MUST begin with an opening double\n"
+                        "   quotation mark (\") and end with a closing double quotation mark (\").\n\n"
+                        "3. SAMPLE RESPONSE LEVELS:\n"
+                        "   - Full Marks: Direct, scientifically accurate sentence perfectly hitting the rubric\n"
+                        "     criteria using correct terminology. (e.g. \"The bean seed undergoes germination.\")\n"
+                        "   - Partial Marks: Direct, confident-sounding answer missing key info or using basic\n"
+                        "     layman terms. (e.g. \"The seed opens up and grows a new plant when it gets wet.\")\n"
+                        "   - Zero Marks: Direct, confident-sounding answer with a complete factual error or\n"
+                        "     misconception. Do NOT make them sound confused. (e.g. \"The seed melts into the dirt.\")\n\n"
+                        "4. ITEM-SPECIFIC CRITERIA: Every criteria row must mention the exact scoring\n"
+                        "   indicators for THIS question — not generic descriptions.\n"
+                        "   ✗ NEVER write: 'correct terminology for Living Creatures: Exploring their\n"
+                        "     Characteristics' or 'appropriate properties of Living Creatures'\n"
+                        "   ✓ DO write: 'identifies the missing fruit/pod-with-seeds stage',\n"
+                        "     'explains role of water and air in seed germination',\n"
+                        "     'describes flower-to-pod formation in the bean plant life cycle'\n\n"
+                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        "RUBRIC TIER DEFINITIONS (apply based on max score):\n"
+                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                         "FOR MAX SCORE = 2 (Short Answer, M2) — 3 rows:\n"
-                        "  2 marks (Full): Student correctly identifies BOTH required scientific properties/concepts\n"
-                        "    using appropriate terminology AND demonstrates understanding of the relationship or application.\n"
-                        "  1 mark (Partial): Student correctly identifies ONE property/concept using appropriate\n"
-                        "    terminology; OR identifies both but uses informal/incorrect terminology; OR demonstrates\n"
-                        "    partial understanding of only one aspect.\n"
-                        "  0 marks (Zero): Irrelevant answer, fundamental misconception, or purely observational\n"
+                        "  2 marks (Full marks): Student correctly identifies BOTH required scientific\n"
+                        "    concepts using appropriate terminology AND demonstrates understanding of\n"
+                        "    their relationship or application to the scenario.\n"
+                        "  1 mark (Partial marks): Student correctly identifies ONE concept; OR identifies\n"
+                        "    both but with informal/incorrect terminology; OR shows partial understanding.\n"
+                        "  0 marks (Zero): Irrelevant, fundamental misconception, or purely observational\n"
                         "    response with no scientific reasoning.\n\n"
-                        "FOR MAX SCORE = 3 (Short Answer or Extended Response, M3) — 4 rows:\n"
-                        "  3 marks (Full): Student correctly applies the relevant concept(s) to the given scenario,\n"
-                        "    accurately predicts/explains the outcome, uses precise scientific terminology, AND demonstrates\n"
-                        "    clear logical reasoning with no conceptual errors.\n"
-                        "  2 marks (Substantial): Correctly applies the main concept(s) with minor omissions; OR correct\n"
-                        "    outcome stated with mostly complete reasoning; OR accurate in 2 out of 3 required elements.\n"
-                        "  1 mark (Basic): Some relevant scientific understanding shown but concept applied incorrectly\n"
-                        "    or partially; OR correct outcome stated without reasoning; OR reasoning stated without\n"
-                        "    a correct outcome.\n"
+                        "FOR MAX SCORE = 3 (Short Answer or Extended Response, M3 and M4) — 4 rows:\n"
+                        "  3 marks (Full marks): Student correctly applies all concept(s) to the scenario,\n"
+                        "    accurately explains outcome, uses precise terminology, clear logical reasoning.\n"
+                        "  2 marks (Partial): Correct outcome with mostly complete reasoning; accurate\n"
+                        "    in 2 of 3 required elements; minor omissions only.\n"
+                        "  1 mark (Minimal): Some relevant understanding shown but applied incorrectly or\n"
+                        "    partially; OR correct outcome stated without reasoning.\n"
                         "  0 marks (Zero): Irrelevant, fundamentally incorrect, or blank.\n\n"
-                        "FOR MAX SCORE = 4 (Extended Constructed Response, M4) — 5 rows:\n"
-                        "  4 marks (Full): Student evaluates the flawed claim comprehensively: identifies the specific\n"
-                        "    error in reasoning, provides a scientifically accurate correction supported by at least two\n"
-                        "    relevant properties, AND articulates why the original claim fails against the task's actual\n"
-                        "    requirements.\n"
-                        "  3 marks (Strong): Identifies the flawed reasoning AND provides accurate correction with one\n"
-                        "    key property clearly justified. Minor gap in a second supporting property, but core argument\n"
-                        "    is scientifically sound.\n"
-                        "  2 marks (Moderate): States what went wrong practically (bag broke, material failed) but does\n"
-                        "    not explicitly frame it as a flaw in scientific reasoning; OR provides a correction but\n"
-                        "    cannot clearly explain why the original claim was wrong.\n"
-                        "  1 mark (Minimal): Recognises the claim is incorrect and names at least one relevant property,\n"
-                        "    but provides no justification or uses the property incorrectly.\n"
-                        "  0 marks (Zero): Defends the flawed claim, provides entirely irrelevant content, or is blank.\n\n"
-                        "INSTRUCTIONS:\n"
-                        "  - Write rubric rows that are SPECIFIC to this question — not generic.\n"
-                        "  - Each row must contain: Criteria (what must be present) + Sample Response (a realistic\n"
-                        "    example of a student answer at that tier, 1–3 sentences).\n"
-                        "  - Sample responses must sound like real Grade 6 students, not model adults.\n"
-                        "  - The sample response at 0 marks must show a specific realistic misconception.\n\n"
-                        "OUTPUT: JSON only:\n"
+                        "OUTPUT: JSON only, no other text:\n"
                         "{\n"
                         '  "rows": [\n'
-                        '    {"score": 2, "label": "Full marks", "criteria": "...", "sample": "..."},\n'
-                        '    {"score": 1, "label": "Partial marks", "criteria": "...", "sample": "..."},\n'
-                        '    {"score": 0, "label": "Zero", "criteria": "...", "sample": "..."}\n'
+                        '    {"score": 3, "label": "Full marks", "criteria": "...", "sample": "\\\"Student response here...\\\""},\n'
+                        '    {"score": 2, "label": "Partial", "criteria": "...", "sample": "\\\"Student response here...\\\""},\n'
+                        '    {"score": 1, "label": "Minimal", "criteria": "...", "sample": "\\\"Student response here...\\\""},\n'
+                        '    {"score": 0, "label": "Zero", "criteria": "...", "sample": "\\\"Student response here...\\\"" }\n'
                         '  ]\n'
                         "}\n"
-                        "Score values must match: 0 through max_score (descending order).\n"
-                        'Label values: "Full marks", "Strong partial" (M4 only), "Substantial" (M3 only),\n'
-                        '  "Partial marks", "Basic", "Minimal" (M4 only), "Zero".'
+                        "Score values: 0 through max_score in descending order.\n"
+                        'Labels: "Full marks", "Partial" (or "Partial marks"), "Minimal", "Zero".'
                     )
-                    
+
                     user_msg_c5 = (
                         f"Item Type: {item_type}\n"
                         f"Mastery Level: {confirmed_mastery}\n"
@@ -1292,10 +1555,13 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
                         f"Topic: {topic}\n"
                         f"Item Stem: {stem}\n"
                         f"Stimulus: {stimulus if stimulus else 'None'}\n"
-                        f"Model Answer / Correct Response: {row.get('Correct_Answer')}"
+                        f"Model Answer / Correct Response: {row.get('Correct_Answer')}\n\n"
+                        "REMINDER: Sample responses must be in double quotation marks and written as "
+                        "direct, confident answers. Criteria must reference the exact concepts in "
+                        "THIS question — never use generic phrases or chapter-title references."
                     )
-                    
-                    rubric_data = call_mistral(client, system_prompt_c5, user_msg_c5, max_tokens=800, use_json=True)
+
+                    rubric_data = call_mistral(client, system_prompt_c5, user_msg_c5, max_tokens=1200, use_json=True)
                 except Exception:
                     rubric_data = generate_mock_rubric(row, max_score, chapter_name=matched_chapter)
                     
@@ -1318,10 +1584,9 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
                 else:
                     # Fallback criteria row
                     lbl = {
-                        4: "Full marks",
-                        3: "Substantial" if max_score == 3 else "Strong partial",
-                        2: "Moderate partial" if max_score == 4 else ("Full marks" if max_score == 2 else "Substantial"),
-                        1: "Partial marks" if max_score == 2 else "Basic",
+                        3: "Full marks",
+                        2: "Full marks" if max_score == 2 else "Partial",
+                        1: "Partial marks" if max_score == 2 else "Minimal",
                         0: "Zero"
                     }.get(exp_score, "Criteria tier")
                     
@@ -1350,7 +1615,7 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
             "Item_Type": item_type,
             "No_Of_Options": num_options,
             "Has_Image": has_image,
-            "Image_File_Name": f"{item_id}-img01.png" if has_image == "Yes" else "",
+            "Image_File_Name": image_file_name,
             "Has_Table": has_table,
             "Has_Equation": has_equation,
             "Equation_Format": eq_format if has_equation == "Yes" else "",
@@ -1450,7 +1715,7 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
             [("Chapter *", True), (batch_meta["chapter_name"], False), ("Chapter Code *", True), (batch_meta["chapter_code"], False)],
             [("Topic *", True), (item["Topic"], False), ("Topic ID *", True), (item["Topic_ID"], False)],
             [("NCF CG #", True), (item["NCF_CG"], False), ("Competency", True), (item["Competency"], False)],
-            [("Learning Outcome *", True), (item["Learning_Outcome"], False), ("LO ID", True), (item["LO_ID"], False)]
+            [("Learning Outcome *", True), (item["Learning_Outcome"], False), ("LO ID", True), ("", False)]
         ]
         for r_idx, row_labels in enumerate(labels_t3):
             for c_idx, (text, is_label) in enumerate(row_labels):
@@ -1513,6 +1778,8 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
                     set_cell_shading(cell, "e2e8f0")
                 set_cell_text(cell, text, bold=is_label)
                 
+        doc.add_paragraph()
+        
         # Table 7: Quality flags guidance
         t7 = create_styled_table(doc, 1, [9360], border_color="2e5f8a")
         set_cell_shading(t7.rows[0].cells[0], "f4f6f9")
@@ -1532,6 +1799,8 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
         t9 = create_styled_table(doc, 1, [9360], border_color="2e5f8a")
         set_cell_shading(t9.rows[0].cells[0], "f4f6f9")
         set_cell_text(t9.rows[0].cells[0], "Leave blank if no stimulus. For M1 items a stimulus is often not needed. For M3 and M4 a well-designed stimulus is mandatory.", italic=True)
+        
+        doc.add_paragraph()
         
         # Table 10: Stimulus text
         t10 = create_styled_table(doc, 1, [2000, 7360])
@@ -1581,14 +1850,13 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
             for r_idx, letter in enumerate(["A", "B", "C", "D"], start=1):
                 is_correct = "Yes" if item["Correct_Option"] == letter else "No"
                 opt_val = item[f"Option_{letter}"]
-                
-                # Combine option text and distractor rationale in cell (for incorrect options only)
-                if is_correct == "No":
-                    rat = item["Distractor_Rationales"].get(f"rationale_{letter.lower()}", "")
-                    combined_opt_text = f"{opt_val}\n{rat}" if rat else opt_val
-                else:
-                    combined_opt_text = opt_val
-                
+
+                # Show diagnostic rationale for ALL options:
+                # - Correct option: shows "CORRECT ANSWER: ..." explanation
+                # - Incorrect options: shows error-type rationale
+                rat = item["Distractor_Rationales"].get(f"rationale_{letter.lower()}", "")
+                combined_opt_text = f"{opt_val}\n{rat}" if rat else opt_val
+
                 set_cell_text(t12.rows[r_idx].cells[0], letter, bold=True)
                 set_cell_text(t12.rows[r_idx].cells[1], is_correct)
                 set_cell_text(t12.rows[r_idx].cells[2], combined_opt_text)
@@ -1632,6 +1900,8 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
         set_cell_shading(t15.rows[0].cells[0], "f4f6f9")
         set_cell_text(t15.rows[0].cells[0], "Skip B6 for MCQ items. For Short and Extended Answer: partial scoring is required — binary marking (full or zero) is not acceptable.", italic=True)
         
+        doc.add_paragraph()
+        
         # Table 16: Rubric Table (Borders 999999 on all cells)
         rubric_rows_data = item["Rubric"].get("rows", [])
         num_rubric_rows = len(rubric_rows_data) + 1 # +1 for header
@@ -1665,6 +1935,8 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback):
         set_cell_shading(t17.rows[0].cells[0], "e2e8f0")
         set_cell_text(t17.rows[0].cells[0], "Notes", bold=True)
         set_cell_text(t17.rows[0].cells[1], "") # Always empty cell on generation
+        
+        doc.add_paragraph()
         
         # Table 18: END OF ITEM
         t18 = create_styled_table(doc, 1, [10298], border_color="2e5f8a")
