@@ -496,8 +496,53 @@ def generate_mock_explanation(row, item_type, correct_letter, rationales, chapte
         )
 
 def generate_mock_rubric(row, max_score, chapter_name="Science"):
-    ans = str(row.get("Correct_Answer") or "")
+    """
+    Question-aware mock rubric generator.
+    Extracts key concepts from the stem, stimulus and correct answer so that
+    every rubric tier references the ACTUAL question content instead of
+    generic placeholder text.
+    """
+    ans   = str(row.get("Correct_Answer") or "").strip()
+    stem  = str(row.get("Item_Stem")      or "").strip()
+    stim  = str(row.get("Stimulus_Text")  or "").strip()
 
+    # ── Build a short concept phrase from the stem (first 80 chars, cleaned) ──
+    # Used to anchor criteria language to this specific question.
+    stem_snippet = re.sub(r'\s+', ' ', stem[:80]).rstrip()
+    if len(stem) > 80:
+        stem_snippet += "…"
+
+    # ── Pull the most meaningful noun-phrase from the correct answer ──────────
+    # We use the first sentence / clause of the answer as the "model concept".
+    ans_first = ans.split('.')[0].split(';')[0].strip() if ans else ""
+    # Truncate very long answers so they fit neatly in sample cells
+    ans_display = (ans_first[:120] + "…") if len(ans_first) > 120 else ans_first
+
+    # ── Derive a partial / layman version of the answer ───────────────────────
+    # Strip technical connectors to simulate an incomplete student answer.
+    partial_ans = re.sub(
+        r'\b(because|therefore|since|as a result|which means|thus|hence)\b.*',
+        '', ans_display, flags=re.IGNORECASE
+    ).strip().rstrip(',;')
+    if not partial_ans:
+        partial_ans = ans_display[:60].rstrip() if ans_display else stem_snippet[:60].rstrip()
+
+    # ── Build a plausible zero-mark misconception from the stem ───────────────
+    # Identify the main subject/verb pair and invert the relationship.
+    stem_words = re.findall(r'[A-Za-z]+', stem.lower())
+    science_nouns = [
+        w for w in stem_words
+        if w not in {'the','a','an','is','are','was','were','of','in','to',
+                     'and','or','but','for','with','this','that','it','does',
+                     'do','not','by','as','at','on','from','which','what','why',
+                     'how','when','will','would','can','could','has','have','had',
+                     'be','been','being','should','if','its','their','they'}
+    ]
+    # Use the first meaningful noun for the misconception sentence
+    key_noun = science_nouns[0] if science_nouns else "the process"
+    zero_sample = f"The {key_noun} does not change because nothing affects it."
+
+    # ── Assemble rubric rows ──────────────────────────────────────────────────
     rows = []
     if max_score == 2:
         rows = [
@@ -505,30 +550,34 @@ def generate_mock_rubric(row, max_score, chapter_name="Science"):
                 "score": 2,
                 "label": "Full marks",
                 "criteria": (
-                    "Student correctly identifies both key scientific concepts and demonstrates "
-                    "understanding of their relationship, using appropriate scientific language."
+                    f"Student correctly identifies BOTH required scientific concepts relevant to "
+                    f"'{stem_snippet}' using appropriate scientific language, AND demonstrates "
+                    f"understanding of how they relate to produce the described outcome."
                 ),
                 "sample": (
-                    f"\"{ans if ans else 'The process happens because of the two factors described in the question, and without either one, the outcome changes.'}\""
+                    f"\"{ans_display if ans_display else stem_snippet}\""
                 )
             },
             {
                 "score": 1,
                 "label": "Partial marks",
                 "criteria": (
-                    "Student correctly identifies one key concept OR identifies both concepts "
-                    "but uses informal or imprecise language."
+                    f"Student correctly identifies ONE of the two required concepts related to "
+                    f"'{stem_snippet}'; OR identifies both concepts but uses informal or "
+                    f"imprecise language without explaining their relationship."
                 ),
-                "sample": "\"The process happens because of one of the main factors.\""
+                "sample": (
+                    f"\"{partial_ans if partial_ans else stem_snippet[:60]}\""
+                )
             },
             {
                 "score": 0,
                 "label": "Zero",
                 "criteria": (
-                    "Irrelevant answer, fundamental misconception, or purely observational "
-                    "response with no scientific reasoning."
+                    f"Irrelevant or fundamentally incorrect answer about '{stem_snippet}'; "
+                    f"purely observational response with no scientific reasoning; or blank."
                 ),
-                "sample": "\"The process does not depend on any factors and happens by itself.\""
+                "sample": f"\"{zero_sample}\""
             }
         ]
     else:  # max_score == 3 or fallback
@@ -537,37 +586,48 @@ def generate_mock_rubric(row, max_score, chapter_name="Science"):
                 "score": 3,
                 "label": "Full marks",
                 "criteria": (
-                    "Student correctly applies the relevant concept(s) to the scenario, "
-                    "accurately predicts or explains the outcome, uses precise scientific "
-                    "terminology, and demonstrates clear logical reasoning with no conceptual errors."
+                    f"Student correctly applies the relevant scientific concept(s) to the "
+                    f"scenario in '{stem_snippet}', accurately explains the outcome using "
+                    f"precise scientific terminology, and demonstrates clear logical reasoning "
+                    f"with no conceptual errors."
                 ),
                 "sample": (
-                    f"\"{ans if ans else 'The scientific concept directly explains the outcome described in the scenario, as demonstrated by the clear process.'}\""
+                    f"\"{ans_display if ans_display else stem_snippet}\""
                 )
             },
             {
                 "score": 2,
                 "label": "Partial",
                 "criteria": (
-                    "Correctly applies main concept(s) with minor omissions; correct outcome "
-                    "stated with mostly complete reasoning; accurate in 2 of 3 required elements."
+                    f"Correctly applies the main concept(s) related to '{stem_snippet}' "
+                    f"with minor omissions; states the correct outcome with mostly complete "
+                    f"reasoning; accurate in 2 of the 3 required elements."
                 ),
-                "sample": "\"The process happens because of the main factor, but the connection is unclear.\""
+                "sample": (
+                    f"\"{partial_ans if partial_ans else stem_snippet[:60]}, but does not fully explain why.\""
+                )
             },
             {
                 "score": 1,
                 "label": "Minimal",
                 "criteria": (
-                    "Some relevant scientific understanding shown but concept applied incorrectly "
-                    "or partially; OR correct outcome stated without reasoning."
+                    f"Shows some relevant scientific understanding about '{stem_snippet}' "
+                    f"but applies the concept incorrectly or partially; OR states the correct "
+                    f"outcome without providing any scientific reasoning."
                 ),
-                "sample": "\"It happens because of this factor.\""
+                "sample": (
+                    f"\"{key_noun.capitalize()} is involved, but I am not sure how.\""
+                    if not ans_display else
+                    f"\"{ans_display.split()[0] if ans_display.split() else key_noun} happens here.\""
+                )
             },
             {
                 "score": 0,
                 "label": "Zero",
-                "criteria": "Irrelevant, fundamentally incorrect, or blank.",
-                "sample": "\"Nothing will happen because the process does not depend on these things.\""
+                "criteria": (
+                    f"Irrelevant, fundamentally incorrect, or blank response to '{stem_snippet}'."
+                ),
+                "sample": f"\"{zero_sample}\""
             }
         ]
 
@@ -1552,13 +1612,22 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback, 
                         f"Item Type: {item_type}\n"
                         f"Mastery Level: {confirmed_mastery}\n"
                         f"Max Score: {max_score}\n"
+                        f"Chapter: {chapter_name}\n"
                         f"Topic: {topic}\n"
-                        f"Item Stem: {stem}\n"
                         f"Stimulus: {stimulus if stimulus else 'None'}\n"
+                        f"Item Stem: {stem}\n"
                         f"Model Answer / Correct Response: {row.get('Correct_Answer')}\n\n"
-                        "REMINDER: Sample responses must be in double quotation marks and written as "
-                        "direct, confident answers. Criteria must reference the exact concepts in "
-                        "THIS question — never use generic phrases or chapter-title references."
+                        "MANDATORY RULES FOR THIS RESPONSE:\n"
+                        "1. Every 'criteria' field MUST name the specific scientific concepts, "
+                        "   terms, or steps from the Item Stem and Model Answer above — "
+                        "   NO generic phrases like 'correct terminology' or 'key concepts'.\n"
+                        "2. Every 'sample' field MUST be a direct student-voice answer that "
+                        "   references the actual subject matter of this question (objects, "
+                        "   characters, processes, measurements, or phenomena named in the stem). "
+                        "   DO NOT write sample responses that could apply to any question.\n"
+                        "3. Full Marks sample: quote or closely paraphrase the Model Answer above.\n"
+                        "4. Partial Marks sample: correct idea, missing one key element from the Model Answer.\n"
+                        "5. Zero Marks sample: plausible-sounding but factually wrong answer about this topic."
                     )
 
                     rubric_data = call_mistral(client, system_prompt_c5, user_msg_c5, max_tokens=1200, use_json=True)
