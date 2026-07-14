@@ -253,6 +253,8 @@ if uploaded_file:
         if matching_sheet is not None:
             df_preview = pd.read_excel(uploaded_file, sheet_name=matching_sheet)
             df_preview.reset_index(drop=True, inplace=True)
+            # Coerce all column names to str to avoid mixed-type warning in Streamlit
+            df_preview.columns = df_preview.columns.astype(str)
             # Only rows with at least a stem
             valid_rows = df_preview[df_preview["Item_Stem"].notna()].copy()
             st.info(
@@ -334,7 +336,7 @@ if ready:
         live_logs = []
 
         def progress_cb(item_num: int, total: int, item_id: str, level: str, msg: str):
-            pct = item_num / total
+            pct = item_num / total if total > 0 else 0.0
             progress_bar.progress(pct, text=f"Processing item {item_num}/{total} — {item_id}")
             status_placeholder.caption(f"Last: [{level}] {item_id} — {msg}")
             live_logs.append(f"[{level}] Row {item_num:>3} | {item_id:<28} | {msg}")

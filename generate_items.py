@@ -18,6 +18,115 @@ from mistralai.client import Mistral
 
 from curriculum_analyzer import load_curriculum_framework, get_next_sequence_number
 
+# ─── AUTHORITATIVE TOPIC → LEARNING OUTCOME MAP ───────────────────────────────
+# Loaded dynamically from PAL Grade 6 Science Tracker (Client Tracker sheet).
+# Two indices are built:
+#   _TRACKER_CHAP_TOPIC_LO  : (norm_chapter, norm_topic) -> LO   [precise]
+#   _TRACKER_TOPIC_LO       : norm_topic -> LO                    [fallback]
+# Both keyed on normalised (lowercase, collapsed whitespace) strings.
+
+def _norm(s: str) -> str:
+    return re.sub(r"[\s\n\r\t]+", " ", str(s).lower().strip())
+
+def _load_tracker_maps():
+    """Load chapter+topic → LO maps from the Client Tracker sheet."""
+    chap_topic_map: dict[tuple[str, str], str] = {}
+    topic_map: dict[str, str] = {}
+
+    tracker_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "PAL grade 6 science tracker.xlsx")
+    if not os.path.exists(tracker_path):
+        return chap_topic_map, topic_map  # graceful degradation
+
+    try:
+        df = pd.read_excel(tracker_path, sheet_name="Client Tracker", header=None)
+        # Columns: 0=Sno, 1=Grade, 2=ChapterNo, 3=ChapterName, 4=Topic, 5=LO
+        current_chapter = ""
+        for _, row in df.iterrows():
+            sno   = str(row.iloc[0]).strip()
+            chap  = str(row.iloc[3]).strip()
+            topic = str(row.iloc[4]).strip()
+            lo    = str(row.iloc[5]).strip()
+
+            # Skip the header row and rows without a topic or LO
+            if sno in ("Sno", "nan") or topic in ("nan", "") or lo in ("nan", ""):
+                continue
+
+            # Forward-fill chapter name (merged cells appear as NaN in subsequent rows)
+            if chap not in ("nan", ""):
+                current_chapter = chap
+
+            norm_chap  = _norm(current_chapter)
+            norm_topic = _norm(topic)
+
+            chap_topic_map[(norm_chap, norm_topic)] = lo
+            # Only store in topic-only map if not already present (first occurrence wins)
+            if norm_topic not in topic_map:
+                topic_map[norm_topic] = lo
+
+    except Exception:
+        pass  # file missing or malformed — callers fall back to hardcoded values
+
+    return chap_topic_map, topic_map
+
+_TRACKER_CHAP_TOPIC_LO, _TRACKER_TOPIC_LO = _load_tracker_maps()
+
+
+def lookup_lo_from_tracker(topic_name: str, chapter_name: str = "") -> str | None:
+    """Return the authoritative Learning Outcome from the Client Tracker sheet.
+
+    Matching priority:
+      1. Exact (chapter, topic) pair
+      2. Substring (chapter, topic) pair
+      3. Exact topic-only match
+      4. Substring topic-only match
+      5. Best word-overlap topic-only match (≥ 2 shared words)
+
+    Returns None if no confident match found.
+    """
+    if not topic_name:
+        return None
+
+    norm_topic = _norm(topic_name)
+    norm_chap  = _norm(chapter_name) if chapter_name else ""
+
+    # ── 1. Exact chapter+topic ────────────────────────────────────────────────
+    if norm_chap:
+        lo = _TRACKER_CHAP_TOPIC_LO.get((norm_chap, norm_topic))
+        if lo:
+            return lo
+
+    # ── 2. Substring chapter+topic ───────────────────────────────────────────
+    if norm_chap:
+        for (kc, kt), lo in _TRACKER_CHAP_TOPIC_LO.items():
+            chap_match  = (norm_chap in kc or kc in norm_chap)
+            topic_match = (norm_topic in kt or kt in norm_topic)
+            if chap_match and topic_match:
+                return lo
+
+    # ── 3. Exact topic-only ──────────────────────────────────────────────────
+    lo = _TRACKER_TOPIC_LO.get(norm_topic)
+    if lo:
+        return lo
+
+    # ── 4. Substring topic-only ──────────────────────────────────────────────
+    for key, lo in _TRACKER_TOPIC_LO.items():
+        if norm_topic in key or key in norm_topic:
+            return lo
+
+    # ── 5. Word-overlap topic-only ───────────────────────────────────────────
+    norm_words = set(re.findall(r'\w+', norm_topic))
+    best_lo, best_overlap = None, 0
+    for key, lo in _TRACKER_TOPIC_LO.items():
+        overlap = len(norm_words & set(re.findall(r'\w+', key)))
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_lo = lo
+    if best_overlap >= 2:
+        return best_lo
+
+    return None
+
 # ─── IMAGE EXTRACTION & GOOGLE DRIVE HELPERS ──────────────────────────────────
 DRIVE_URL_PATTERN = re.compile(
     r'https?://(?:drive|docs)\.google\.com/[^\s\'"<>]+'
@@ -156,6 +265,42 @@ def get_ai_client(api_key: str, api_provider: str = "Mistral"):
             return Groq(api_key=api_key)
     except Exception:
         return None
+
+def split_criteria_and_sample(text):
+    text = text.strip()
+    criteria_text = text
+    sample_text = ""
+    
+    # Match various forms of "Sample Response:" (e.g. Sample response:, Sample:, Sample Answer:)
+    pattern = re.compile(
+        r'(?:sample\s+response|sample\s+answer|sample)\s*[:–\-—]\s*',
+        re.IGNORECASE
+    )
+    match = pattern.search(text)
+    if match:
+        idx = match.start()
+        criteria_part = text[:idx].strip()
+        sample_part = text[match.end():].strip()
+        
+        # Clean up "Criteria:" prefix if present at start of criteria_part
+        criteria_pattern = re.compile(
+            r'^(?:criteria\s*:|criteria\s*–|criteria\s*-|criteria\s*—)\s*',
+            re.IGNORECASE
+        )
+        criteria_part = criteria_pattern.sub("", criteria_part).strip()
+        
+        criteria_text = criteria_part
+        sample_text = sample_part
+    else:
+        # If no "Sample Response" label is found, check if it starts with "Criteria:"
+        criteria_pattern = re.compile(
+            r'^(?:criteria\s*:|criteria\s*–|criteria\s*-|criteria\s*—)\s*',
+            re.IGNORECASE
+        )
+        if criteria_pattern.match(text):
+            criteria_text = criteria_pattern.sub("", text).strip()
+            
+    return criteria_text, sample_text
 
 # ─── XML HELPERS FOR DOCX FORMATTING ──────────────────────────────────────────
 def set_cell_shading(cell, color_hex):
@@ -420,6 +565,54 @@ def generate_mock_format_fields(row, item_type):
         "equation_format": eq_format
     }
 
+# Rationale keywords that indicate an embedded diagnostic note inside an option cell.
+_RATIONALE_PREFIXES = (
+    "CORRECT ANSWER:",
+    "Conceptual error:",
+    "Procedural error:",
+    "Comprehension error:",
+)
+
+def parse_option_with_embedded_rationale(raw_text: str) -> tuple[str, str]:
+    """
+    Split an option cell that may contain an embedded rationale separated by
+    a newline.  Returns (clean_option_text, rationale_text).
+
+    Examples
+    --------
+    "Ant and housefly\nConceptual error: The learner ..."
+      -> ("Ant and housefly", "Conceptual error: The learner ...")
+
+    "Pigeon and housefly\nCORRECT ANSWER: Both pigeon ..."
+      -> ("Pigeon and housefly", "CORRECT ANSWER: Both pigeon ...")
+
+    "Fish"  (no embedded rationale)
+      -> ("Fish", "")
+    """
+    if not raw_text:
+        return "", ""
+    lines = raw_text.split("\n")
+    # Walk lines to find where the embedded rationale begins
+    option_lines = []
+    rationale_lines = []
+    in_rationale = False
+    for line in lines:
+        stripped = line.strip()
+        if not in_rationale:
+            is_rationale_start = any(
+                stripped.startswith(p) for p in _RATIONALE_PREFIXES
+            )
+            if is_rationale_start:
+                in_rationale = True
+                rationale_lines.append(stripped)
+            else:
+                option_lines.append(stripped)
+        else:
+            rationale_lines.append(stripped)
+    clean = " ".join(option_lines).strip()
+    rationale = " ".join(rationale_lines).strip()
+    return clean, rationale
+
 def generate_mock_rationales(row, correct_letter, chapter_name="Science"):
     stem = str(row.get("Item_Stem") or "")
     opts = {
@@ -544,7 +737,65 @@ def generate_mock_rubric(row, max_score, chapter_name="Science"):
 
     # ── Assemble rubric rows ──────────────────────────────────────────────────
     rows = []
-    if max_score == 2:
+    if max_score == 4:
+        rows = [
+            {
+                "score": 4,
+                "label": "Full marks",
+                "criteria": (
+                    f"Student correctly applies the relevant scientific concept(s) to the scenario in "
+                    f"'{stem_snippet}', evaluates the flawed reasoning/claim, provides a justified correction "
+                    f"with precise scientific terminology, and demonstrates clear logical reasoning with no conceptual errors."
+                ),
+                "sample": (
+                    f"\"{ans_display if ans_display else stem_snippet}\""
+                )
+            },
+            {
+                "score": 3,
+                "label": "Partial",
+                "criteria": (
+                    f"Correctly evaluates the flawed claim and states the correct reasoning/correction, but "
+                    f"with minor scientific imprecisions or missing one detailed connection related to '{stem_snippet}'."
+                ),
+                "sample": (
+                    f"\"{partial_ans if partial_ans else stem_snippet[:60]}, which corrects the mistake.\""
+                )
+            },
+            {
+                "score": 2,
+                "label": "Partial",
+                "criteria": (
+                    f"Student identifies the flaw in reasoning related to '{stem_snippet}', but does not "
+                    f"fully explain the correction; OR evaluates it correctly but has a conceptual error in the science."
+                ),
+                "sample": (
+                    f"\"{partial_ans if partial_ans else stem_snippet[:60]}\""
+                )
+            },
+            {
+                "score": 1,
+                "label": "Minimal",
+                "criteria": (
+                    f"Shows some basic scientific understanding related to '{stem_snippet}', but fails to "
+                    f"address the flaw or correct it; OR states the correct outcome without reasoning."
+                ),
+                "sample": (
+                    f"\"{key_noun.capitalize()} is involved, but I am not sure how.\""
+                    if not ans_display else
+                    f"\"{ans_display.split()[0] if ans_display.split() else key_noun} happens here.\""
+                )
+            },
+            {
+                "score": 0,
+                "label": "Zero",
+                "criteria": (
+                    f"Irrelevant, fundamentally incorrect, or blank response to '{stem_snippet}'."
+                ),
+                "sample": f"\"{zero_sample}\""
+            }
+        ]
+    elif max_score == 2:
         rows = [
             {
                 "score": 2,
@@ -933,8 +1184,19 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback, 
         if eh not in clean_headers:
             raise ValueError(f"Required column '{eh}' not found in 'Questions' sheet headers. Found: {clean_headers}")
             
-    # Map headers to indices
-    header_map = {str(cell.value).strip(): col_idx for col_idx, cell in enumerate(sheet[1], start=1) if cell.value is not None}
+    # Map headers to indices — include numeric rubric score columns (0, 1, 2, 3)
+    header_map = {}
+    for col_idx, cell in enumerate(sheet[1], start=1):
+        if cell.value is not None:
+            key = str(cell.value).strip()
+            header_map[key] = col_idx
+            # Also store numeric rubric cols under canonical int keys "score_0" etc.
+            try:
+                numeric_val = float(cell.value)
+                if numeric_val in (0.0, 1.0, 2.0, 3.0, 4.0):
+                    header_map[f"rubric_{int(numeric_val)}"] = col_idx
+            except (ValueError, TypeError):
+                pass
     
     # Read rows
     raw_rows = []
@@ -1007,11 +1269,14 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback, 
             })
             continue
             
-        opt_a = str(row.get("Option_A") or "").strip()
-        opt_b = str(row.get("Option_B") or "").strip()
-        opt_c = str(row.get("Option_C") or "").strip()
-        opt_d = str(row.get("Option_D") or "").strip()
-        correct_opt = str(row.get("Correct_Option") or "").strip().upper()
+        # Strip any embedded rationale from option text before validation
+        opt_a, _ = parse_option_with_embedded_rationale(str(row.get("Option_A") or "").strip())
+        opt_b, _ = parse_option_with_embedded_rationale(str(row.get("Option_B") or "").strip())
+        opt_c, _ = parse_option_with_embedded_rationale(str(row.get("Option_C") or "").strip())
+        opt_d, _ = parse_option_with_embedded_rationale(str(row.get("Option_D") or "").strip())
+        correct_opt_raw = str(row.get("Correct_Option") or "").strip().upper()
+        # Support "C. Answer text" format — extract leading letter only
+        correct_opt = (correct_opt_raw.split(".")[0].split(")")[0].strip()[:1]) if correct_opt_raw else ""
         correct_ans = str(row.get("Correct_Answer") or "").strip()
         mastery_excel = str(row.get("Mastery_Level") or "").strip().upper()
         
@@ -1097,12 +1362,36 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback, 
         topic = str(row.get("Topic") or "").strip()
         stimulus = str(row.get("Stimulus_Text") or "").strip()
         stem = str(row.get("Item_Stem") or "").strip()
-        opt_a = str(row.get("Option_A") or "").strip()
-        opt_b = str(row.get("Option_B") or "").strip()
-        opt_c = str(row.get("Option_C") or "").strip()
-        opt_d = str(row.get("Option_D") or "").strip()
-        correct_opt = str(row.get("Correct_Option") or "").strip().upper()
+        # Split option text from any embedded rationale that follows a newline
+        opt_a, emb_rat_a = parse_option_with_embedded_rationale(str(row.get("Option_A") or "").strip())
+        opt_b, emb_rat_b = parse_option_with_embedded_rationale(str(row.get("Option_B") or "").strip())
+        opt_c, emb_rat_c = parse_option_with_embedded_rationale(str(row.get("Option_C") or "").strip())
+        opt_d, emb_rat_d = parse_option_with_embedded_rationale(str(row.get("Option_D") or "").strip())
+        # Build an embedded-rationale dict if the column already contains them
+        _emb_rats = {"A": emb_rat_a, "B": emb_rat_b, "C": emb_rat_c, "D": emb_rat_d}
+        has_embedded_rationales = any(_emb_rats.values())
+        correct_opt_raw = str(row.get("Correct_Option") or "").strip().upper()
+        # Support "C. Answer text" format — extract leading letter only
+        correct_opt = (correct_opt_raw.split(".")[0].split(")")[0].strip()[:1]) if correct_opt_raw else ""
         correct_ans = str(row.get("Correct_Answer") or "").strip()
+        # Read pre-authored Explanation and rubric columns from the input template
+        explanation_from_input = str(row.get("Explanation") or "").strip()
+        rubric_score_0 = str(row.get("rubric_0") or "").strip()
+        rubric_score_1 = str(row.get("rubric_1") or "").strip()
+        rubric_score_2 = str(row.get("rubric_2") or "").strip()
+        rubric_score_3 = str(row.get("rubric_3") or "").strip()
+        rubric_score_4 = str(row.get("rubric_4") or "").strip()
+        
+        # Check for Table/Data and Equation columns from the input spreadsheet row case-insensitively
+        table_data_val = ""
+        equation_val = ""
+        for key, val in row.items():
+            if val is not None:
+                norm_key = str(key).strip().lower()
+                if norm_key in ("table/data", "table_data", "table data", "table", "data"):
+                    table_data_val = str(val).strip()
+                elif norm_key in ("equation", "equations", "formula", "formulas"):
+                    equation_val = str(val).strip()
         
         # ─── TOPIC CLASSIFICATION & ALIGNMENT ─────────────────────────────────
         if file_name_topic:
@@ -1139,6 +1428,14 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback, 
                 item_competency = "C-1.1"
                 item_learning_outcome = "Identifies and explains different properties of materials and relates them to their uses."
                 item_lo_id = "LO-1.1.a"
+
+        # ─── AUTHORITATIVE LO OVERRIDE: tracker map takes priority ────────────
+        # The PAL Grade 6 tracker (Client Tracker sheet) is the ground-truth
+        # source for learning outcomes. If the topic resolves to a known entry,
+        # override whatever the framework file gave us.
+        tracker_lo = lookup_lo_from_tracker(item_topic, chapter_name=matched_chapter)
+        if tracker_lo:
+            item_learning_outcome = tracker_lo
 
         # Sequence number starts from start_seq and increments sequentially for each item in this run
         item_seq = i + batch_meta.get("start_seq", 1)
@@ -1340,12 +1637,18 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback, 
         # ─── CALL 3: DISTRACTOR RATIONALE GENERATION (MCQ Only) ───────────────
         distractor_rationales = {}
         if item_type == "MCQ":
-            if progress_callback:
-                progress_callback(i + 1, total_valid, item_id, confirmed_mastery, "Generating distractor rationales...")
-
-            if is_mock:
+            if has_embedded_rationales:
+                # Option cells already contain diagnostic rationales — use them directly.
+                if progress_callback:
+                    progress_callback(i + 1, total_valid, item_id, confirmed_mastery, "Using pre-authored rationales from input...")
+                for letter in ("A", "B", "C", "D"):
+                    rat = _emb_rats.get(letter, "")
+                    distractor_rationales[f"rationale_{letter.lower()}"] = rat
+            elif is_mock:
                 distractor_rationales = generate_mock_rationales(row, correct_opt, chapter_name=matched_chapter)
             else:
+                if progress_callback:
+                    progress_callback(i + 1, total_valid, item_id, confirmed_mastery, "Generating distractor rationales...")
                 try:
                     system_prompt_c3 = (
                         "You are an expert assessment designer for Grade 6 Science (NCF 2023, India).\n"
@@ -1413,77 +1716,84 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback, 
                     distractor_rationales = generate_mock_rationales(row, correct_opt, chapter_name=matched_chapter)
 
         # ─── CALL 4: ANSWER EXPLANATION GENERATION ────────────────────────────
-        if progress_callback:
-            progress_callback(i + 1, total_valid, item_id, confirmed_mastery, "Generating answer explanation...")
-
-        if is_mock:
-            explanation_text = generate_mock_explanation(row, item_type, correct_opt, distractor_rationales, chapter_name=matched_chapter)
+        # If the input file has a pre-authored Explanation, use it verbatim.
+        # Only call the AI if the Explanation column is blank.
+        if explanation_from_input:
+            explanation_text = explanation_from_input
+            if progress_callback:
+                progress_callback(i + 1, total_valid, item_id, confirmed_mastery, "Using pre-authored explanation from input...")
         else:
-            try:
-                system_prompt_c4 = (
-                    "You are a Grade 6 Science teacher in India writing student-facing feedback\n"
-                    "for an educational platform. Write in plain, simple, kid-friendly British English\n"
-                    "suitable for 11-to-12-year-olds.\n\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    "STUDENT-FACING ANSWER EXPLANATION GUIDELINES\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "IF THE QUESTION IS AN MCQ — use this EXACT structure (no deviations):\n"
-                    "  Step 1 — State correct answer (exact phrase required):\n"
-                    "    'The correct answer is [Option Letter]. [Full Option Text].'\n"
-                    "  Step 2 — Explain the correct answer:\n"
-                    "    Brief paragraph (2-3 sentences) explaining the scientific concept.\n"
-                    "    Apply the concept DIRECTLY to the specific scenario/question asked.\n"
-                    "    Do NOT give a generic definition. Connect it to what the question described.\n"
-                    "  Step 3 — Distractor heading (exact phrase required):\n"
-                    "    'Why other options are incorrect:'\n"
-                    "  Step 4 — Per incorrect option (exact format required):\n"
-                    "    'Option [Letter] ([Full Option Text]) is incorrect because [simple, kid-friendly\n"
-                    "    explanation of the specific misconception].'\n"
-                    "    Repeat for each incorrect option.\n\n"
-                    "IF THE QUESTION IS CONSTRUCTED RESPONSE (Short Answer / ECR) — use this structure:\n"
-                    "  Write a SINGLE cohesive paragraph.\n"
-                    "  Do NOT just state the generic scientific definition.\n"
-                    "  Apply the scientific explanation directly to the specific characters, objects,\n"
-                    "  or scenario mentioned in the question (e.g., if the question mentions Riya's\n"
-                    "  diagram, refer to Riya's diagram specifically).\n\n"
-                    "LANGUAGE RULES:\n"
-                    "  - Plain British English. Short sentences. Age 11-12.\n"
-                    "  - Scientifically accurate, NCF 2023 Grade 6 aligned.\n"
-                    "  - Everyday analogies where helpful.\n"
-                    "  - NEVER end a sentence with double full stops (..).\n"
-                    "  - NEVER reference the chapter title generically (e.g., 'Living Creatures:\n"
-                    "    Exploring their Characteristics'). Reference the specific concept instead.\n\n"
-                    "OUTPUT: Plain text only. No JSON. No markdown headers. Just the explanation text."
-                )
+            if progress_callback:
+                progress_callback(i + 1, total_valid, item_id, confirmed_mastery, "Generating answer explanation...")
 
-                correct_ans_or_opt_text = (
-                    row["Correct_Option"] + ". " + str(row.get(f"Option_{correct_opt}"))
-                    if item_type == "MCQ" else row["Correct_Answer"]
-                )
-
-                user_msg_c4 = (
-                    f"Item Type: {item_type}\n"
-                    f"Topic: {topic}\n"
-                    f"Stimulus: {stimulus if stimulus else 'None'}\n"
-                    f"Item Stem: {stem}\n"
-                    f"Correct Answer: {correct_ans_or_opt_text}\n"
-                    + (
-                        f"Option A: {row.get('Option_A')}\n"
-                        f"Option B: {row.get('Option_B')}\n"
-                        f"Option C: {row.get('Option_C')}\n"
-                        f"Option D: {row.get('Option_D')}\n"
-                        if item_type == "MCQ" else ""
-                    )
-                    + (
-                        f"Distractor rationales (use these to write the 'Why other options are "
-                        f"incorrect' section): {json.dumps(distractor_rationales)}"
-                        if item_type == "MCQ" else ""
-                    )
-                )
-
-                explanation_text = call_mistral(client, system_prompt_c4, user_msg_c4, max_tokens=700, use_json=False)
-            except Exception:
+            if is_mock:
                 explanation_text = generate_mock_explanation(row, item_type, correct_opt, distractor_rationales, chapter_name=matched_chapter)
+            else:
+                try:
+                    system_prompt_c4 = (
+                        "You are a Grade 6 Science teacher in India writing student-facing feedback\n"
+                        "for an educational platform. Write in plain, simple, kid-friendly British English\n"
+                        "suitable for 11-to-12-year-olds.\n\n"
+                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        "STUDENT-FACING ANSWER EXPLANATION GUIDELINES\n"
+                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                        "IF THE QUESTION IS AN MCQ — use this EXACT structure (no deviations):\n"
+                        "  Step 1 — State correct answer (exact phrase required):\n"
+                        "    'The correct answer is [Option Letter]. [Full Option Text].'\n"
+                        "  Step 2 — Explain the correct answer:\n"
+                        "    Brief paragraph (2-3 sentences) explaining the scientific concept.\n"
+                        "    Apply the concept DIRECTLY to the specific scenario/question asked.\n"
+                        "    Do NOT give a generic definition. Connect it to what the question described.\n"
+                        "  Step 3 — Distractor heading (exact phrase required):\n"
+                        "    'Why other options are incorrect:'\n"
+                        "  Step 4 — Per incorrect option (exact format required):\n"
+                        "    'Option [Letter] ([Full Option Text]) is incorrect because [simple, kid-friendly\n"
+                        "    explanation of the specific misconception].'\n"
+                        "    Repeat for each incorrect option.\n\n"
+                        "IF THE QUESTION IS CONSTRUCTED RESPONSE (Short Answer / ECR) — use this structure:\n"
+                        "  Write a SINGLE cohesive paragraph.\n"
+                        "  Do NOT just state the generic scientific definition.\n"
+                        "  Apply the scientific explanation directly to the specific characters, objects,\n"
+                        "  or scenario mentioned in the question (e.g., if the question mentions Riya's\n"
+                        "  diagram, refer to Riya's diagram specifically).\n\n"
+                        "LANGUAGE RULES:\n"
+                        "  - Plain British English. Short sentences. Age 11-12.\n"
+                        "  - Scientifically accurate, NCF 2023 Grade 6 aligned.\n"
+                        "  - Everyday analogies where helpful.\n"
+                        "  - NEVER end a sentence with double full stops (..).\n"
+                        "  - NEVER reference the chapter title generically (e.g., 'Living Creatures:\n"
+                        "    Exploring their Characteristics'). Reference the specific concept instead.\n\n"
+                        "OUTPUT: Plain text only. No JSON. No markdown headers. Just the explanation text."
+                    )
+
+                    correct_ans_or_opt_text = (
+                        row["Correct_Option"] + ". " + str(row.get(f"Option_{correct_opt}"))
+                        if item_type == "MCQ" else row["Correct_Answer"]
+                    )
+
+                    user_msg_c4 = (
+                        f"Item Type: {item_type}\n"
+                        f"Topic: {topic}\n"
+                        f"Stimulus: {stimulus if stimulus else 'None'}\n"
+                        f"Item Stem: {stem}\n"
+                        f"Correct Answer: {correct_ans_or_opt_text}\n"
+                        + (
+                            f"Option A: {row.get('Option_A')}\n"
+                            f"Option B: {row.get('Option_B')}\n"
+                            f"Option C: {row.get('Option_C')}\n"
+                            f"Option D: {row.get('Option_D')}\n"
+                            if item_type == "MCQ" else ""
+                        )
+                        + (
+                            f"Distractor rationales (use these to write the 'Why other options are "
+                            f"incorrect' section): {json.dumps(distractor_rationales)}"
+                            if item_type == "MCQ" else ""
+                        )
+                    )
+
+                    explanation_text = call_mistral(client, system_prompt_c4, user_msg_c4, max_tokens=700, use_json=False)
+                except Exception:
+                    explanation_text = generate_mock_explanation(row, item_type, correct_opt, distractor_rationales, chapter_name=matched_chapter)
                 
         # ─── DETERMINISTIC RULES DERIVATIONS ──────────────────────────────────
         blooms = {
@@ -1508,22 +1818,27 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback, 
         else: # Extended Response
             est_time = "5 mins"
             
-        # Max Score
-        if item_type == "MCQ":
+        # Max Score / Scoring Type / Scale based strictly on cognitive demand / Mastery Level (NCF alignment)
+        if confirmed_mastery == "M1":
             max_score = 1
+            scoring_type = "Dichotomous"
+            scale = ""
         elif confirmed_mastery == "M2":
             max_score = 2
-        else: # M3 and M4
+            scoring_type = "Polytomous(0-2)"
+            scale = "0 / 1 / 2"
+        elif confirmed_mastery == "M3":
             max_score = 3
-            
-        # Scoring Type
-        scoring_type = "Dichotomous (0/1)" if item_type == "MCQ" else f"Polytomous (0-{max_score})"
-        
-        # Scale
-        if item_type == "MCQ":
-            scale = ""
+            scoring_type = "Polytomous(0-3)"
+            scale = "0 / 1 / 2 / 3"
+        elif confirmed_mastery == "M4":
+            max_score = 4
+            scoring_type = "Polytomous(0-4)"
+            scale = "0 / 1 / 2 / 3 / 4"
         else:
-            scale = ", ".join(str(s) for s in range(max_score + 1))
+            max_score = 3
+            scoring_type = "Polytomous(0-3)"
+            scale = "0 / 1 / 2 / 3"
             
         # Prerequisite Level
         prereq = {
@@ -1540,12 +1855,75 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback, 
         feedback_type = "Immediate" if item_type == "MCQ" else "Delayed"
         
         # ─── CALL 5: MARKING RUBRIC GENERATION (Non-MCQ Only) ─────────────────
+        # First try to use rubric rows pre-authored in the input template
+        # (columns 0, 1, 2, 3 of the spreadsheet).
+        # Rules by mastery level:
+        #   M4 → rows 0,1,2,3  (4 rows)
+        #   M3 → rows 0,1,2,3  (4 rows)
+        #   M2 → rows 0,1,2    (3 rows; col 3 is blank/N/A)
+        #   M1 / MCQ → no rubric (leave empty)
         rubric_data = {"rows": []}
         if item_type != "MCQ":
-            if progress_callback:
-                progress_callback(i + 1, total_valid, item_id, confirmed_mastery, "Generating marking rubric...")
+            # Determine which score tiers we expect from the input columns
+            if confirmed_mastery == "M4":
+                input_rubric_scores = [4, 3, 2, 1, 0]
+            elif confirmed_mastery == "M3":
+                input_rubric_scores = [3, 2, 1, 0]
+            else:  # M2
+                input_rubric_scores = [2, 1, 0]
 
-            if is_mock:
+            # Score → label mapping consistent with the rest of the pipeline
+            if max_score == 4:
+                score_labels = {
+                    4: "Full marks",
+                    3: "Partial",
+                    2: "Partial",
+                    1: "Minimal",
+                    0: "Zero"
+                }
+            elif max_score == 3:
+                score_labels = {
+                    3: "Full marks",
+                    2: "Partial",
+                    1: "Minimal",
+                    0: "Zero"
+                }
+            else:  # max_score == 2
+                score_labels = {
+                    2: "Full marks",
+                    1: "Partial marks",
+                    0: "Zero"
+                }
+            # Map score → pre-authored content from input cols
+            input_rubric_content = {
+                4: rubric_score_4,
+                3: rubric_score_3,
+                2: rubric_score_2,
+                1: rubric_score_1,
+                0: rubric_score_0,
+            }
+
+            # Check if ANY of the relevant rubric columns are filled
+            has_input_rubric = any(
+                input_rubric_content[s] for s in input_rubric_scores
+            )
+
+            if has_input_rubric:
+                # Use the input rubric rows directly — skip Call 5
+                if progress_callback:
+                    progress_callback(i + 1, total_valid, item_id, confirmed_mastery, "Using pre-authored rubric from input...")
+                input_rows = []
+                for score in input_rubric_scores:
+                    content = input_rubric_content[score]
+                    if content:  # Only add rows that have content
+                        input_rows.append({
+                            "score": score,
+                            "label": score_labels.get(score, "Criteria tier"),
+                            "criteria": content,
+                            "sample": "",  # Sample is embedded in content if author included it
+                        })
+                rubric_data = {"rows": input_rows}
+            elif is_mock:
                 rubric_data = generate_mock_rubric(row, max_score, chapter_name=matched_chapter)
             else:
                 try:
@@ -1587,7 +1965,7 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback, 
                         "    both but with informal/incorrect terminology; OR shows partial understanding.\n"
                         "  0 marks (Zero): Irrelevant, fundamental misconception, or purely observational\n"
                         "    response with no scientific reasoning.\n\n"
-                        "FOR MAX SCORE = 3 (Short Answer or Extended Response, M3 and M4) — 4 rows:\n"
+                        "FOR MAX SCORE = 3 (Short Answer or Extended Response, M3) — 4 rows:\n"
                         "  3 marks (Full marks): Student correctly applies all concept(s) to the scenario,\n"
                         "    accurately explains outcome, uses precise terminology, clear logical reasoning.\n"
                         "  2 marks (Partial): Correct outcome with mostly complete reasoning; accurate\n"
@@ -1595,17 +1973,29 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback, 
                         "  1 mark (Minimal): Some relevant understanding shown but applied incorrectly or\n"
                         "    partially; OR correct outcome stated without reasoning.\n"
                         "  0 marks (Zero): Irrelevant, fundamentally incorrect, or blank.\n\n"
+                        "FOR MAX SCORE = 4 (Extended Response, M4) — 5 rows:\n"
+                        "  4 marks (Full marks): Student correctly applies the concept(s) to the scenario,\n"
+                        "    evaluates the flawed reasoning/claim, provides a justified correction with precise\n"
+                        "    scientific terminology, and demonstrates clear logical reasoning with no errors.\n"
+                        "  3 marks (Partial): Correctly evaluates the flawed claim and states the correct reasoning/correction,\n"
+                        "    but with minor scientific imprecisions or missing one detailed connection.\n"
+                        "  2 marks (Partial): Student identifies the flaw in reasoning, but does not fully explain the\n"
+                        "    correction; OR evaluates it correctly but has a conceptual error in the science.\n"
+                        "  1 mark (Minimal): Shows some basic scientific understanding related to the topic, but fails\n"
+                        "    to address the flaw or correct it; OR states the correct outcome without reasoning.\n"
+                        "  0 marks (Zero): Irrelevant, fundamentally incorrect, or blank.\n\n"
                         "OUTPUT: JSON only, no other text:\n"
                         "{\n"
                         '  "rows": [\n'
-                        '    {"score": 3, "label": "Full marks", "criteria": "...", "sample": "\\\"Student response here...\\\""},\n'
+                        '    {"score": 4, "label": "Full marks", "criteria": "...", "sample": "\\\"Student response here...\\\""},\n'
+                        '    {"score": 3, "label": "Partial", "criteria": "...", "sample": "\\\"Student response here...\\\""},\n'
                         '    {"score": 2, "label": "Partial", "criteria": "...", "sample": "\\\"Student response here...\\\""},\n'
                         '    {"score": 1, "label": "Minimal", "criteria": "...", "sample": "\\\"Student response here...\\\""},\n'
                         '    {"score": 0, "label": "Zero", "criteria": "...", "sample": "\\\"Student response here...\\\"" }\n'
                         '  ]\n'
                         "}\n"
                         "Score values: 0 through max_score in descending order.\n"
-                        'Labels: "Full marks", "Partial" (or "Partial marks"), "Minimal", "Zero".'
+                        'Labels: "Full marks", "Partial", "Minimal", "Zero".'
                     )
 
                     user_msg_c5 = (
@@ -1633,7 +2023,7 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback, 
                     rubric_data = call_mistral(client, system_prompt_c5, user_msg_c5, max_tokens=1200, use_json=True)
                 except Exception:
                     rubric_data = generate_mock_rubric(row, max_score, chapter_name=matched_chapter)
-                    
+
             # Rubric Quality Check (Rule 7.6)
             rows = rubric_data.get("rows", [])
             valid_rows = []
@@ -1648,7 +2038,7 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback, 
                         matching_row = r
                         break
                         
-                if matching_row and matching_row.get("criteria") and matching_row.get("sample"):
+                if matching_row and matching_row.get("criteria"):
                     valid_rows.append(matching_row)
                 else:
                     # Fallback criteria row
@@ -1669,10 +2059,11 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback, 
                     
             rubric_data["rows"] = valid_rows
             
-        # Compile item dictionary
         enriched_item = {
             "Item_ID": item_id,
             "images": row.get("_images", []),
+            "Table_Data": table_data_val,
+            "Equation": equation_val,
             "Mastery_Level": confirmed_mastery,
             "Blooms_Level": blooms,
             "DoK_Level": dok,
@@ -1800,7 +2191,7 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback, 
         t4 = create_styled_table(doc, 4, [1600, 3080, 1600, 3080])
         labels_t4 = [
             [("Mastery Level *", True), (item["Mastery_Level"], False), ("Bloom's Level *", True), (item["Blooms_Level"], False)],
-            [("DoK Level *", True), (item["DoK_Level"], False), ("Estimated Time *", True), (item["Estimated_Time"], False)],
+            [("DoK Level *", True), (item["DoK_Level"], False), ("Estimated Time *", True), ("", False)],
             [("Max Score *", True), (str(item["Max_Score"]), False), ("Scoring Type *", True), (item["Scoring_Type"], False)],
             [("If Partial — Scale", True), (item["If_Partial_Scale"], False), ("Prerequisite Level", True), (item["Prerequisite_Level"], False)]
         ]
@@ -1817,7 +2208,7 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback, 
         # Table 5: Item Format
         t5 = create_styled_table(doc, 4, [1600, 3080, 1600, 3080])
         # Format Item Type name for table display (Rule 3.12 mapping)
-        display_type = "Extended Constructed Response" if item["Item_Type"] == "Extended Response" else item["Item_Type"]
+        display_type = item["Item_Type"]
         labels_t5 = [
             [("Item Type *", True), (display_type, False), ("No. of Options", True), (item["No_Of_Options"], False)],
             [("Has Image? *", True), (item["Has_Image"], False), ("Image File Name", True), (item["Image_File_Name"], False)],
@@ -1871,17 +2262,22 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback, 
         
         doc.add_paragraph()
         
-        # Table 10: Stimulus text
-        t10 = create_styled_table(doc, 1, [2000, 7360])
-        set_cell_shading(t10.rows[0].cells[0], "e2e8f0")
-        set_cell_text(t10.rows[0].cells[0], "Stimulus text", bold=True)
-        stim_cell = t10.rows[0].cells[1]
-        set_cell_text(stim_cell, item["Stimulus_Text"])
+        # Table 10: Stimulus text, image, table/data, equation (4 rows, 2 columns)
+        t10 = create_styled_table(doc, 4, [2000, 7360])
+        labels_t10 = ["Stimulus text", "Image", "Table/Data", "Equation"]
+        for r_idx, label in enumerate(labels_t10):
+            cell_label = t10.rows[r_idx].cells[0]
+            set_cell_shading(cell_label, "e2e8f0")
+            set_cell_text(cell_label, label, bold=True)
+            
+        # Row 0: Stimulus text
+        set_cell_text(t10.rows[0].cells[1], item.get("Stimulus_Text", ""))
         
-        # If there are images, attach them to the Stimulus block
+        # Row 1: Image
+        img_cell = t10.rows[1].cells[1]
         if item.get("images"):
             for img_bytes in item["images"]:
-                p = stim_cell.add_paragraph()
+                p = img_cell.add_paragraph()
                 p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 p.paragraph_format.space_before = Pt(6)
                 p.paragraph_format.space_after = Pt(6)
@@ -1890,10 +2286,18 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback, 
                     img_stream = io.BytesIO(img_bytes)
                     run.add_picture(img_stream, width=Inches(4.0))
                 except Exception as img_err:
-                    p_err = stim_cell.add_paragraph()
+                    p_err = img_cell.add_paragraph()
                     r_err = p_err.add_run(f"[Error rendering attached image: {img_err}]")
                     r_err.font.italic = True
                     r_err.font.color.rgb = RGBColor(255, 0, 0)
+        else:
+            set_cell_text(img_cell, "")
+            
+        # Row 2: Table/Data
+        set_cell_text(t10.rows[2].cells[1], item.get("Table_Data", ""))
+        
+        # Row 3: Equation
+        set_cell_text(t10.rows[3].cells[1], item.get("Equation", ""))
         
         # Subsection Header
         add_section_header(doc, "B2.  Item Stem  ", "(the question or instruction the learner must respond to)")
@@ -1908,12 +2312,13 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback, 
         add_section_header(doc, "B3.  Response Options  ", "(for MCQ only — skip for Short Answer / Extended Response)")
         
         # Table 12: Options (Borders 999999 on all cells)
-        t12 = create_styled_table(doc, 5, [877, 1059, 7424], border_color="999999")
+        t12 = create_styled_table(doc, 5, [877, 1059, 3712, 3712], border_color="999999")
         
         # Row 1 headers
         set_cell_text(t12.rows[0].cells[0], "Option", bold=True)
         set_cell_text(t12.rows[0].cells[1], "Correct?", bold=True)
         set_cell_text(t12.rows[0].cells[2], "Option Text", bold=True)
+        set_cell_text(t12.rows[0].cells[3], "Distractor/Correct Answer Explanation", bold=True)
         
         if item["Item_Type"] == "MCQ":
             for r_idx, letter in enumerate(["A", "B", "C", "D"], start=1):
@@ -1924,17 +2329,18 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback, 
                 # - Correct option: shows "CORRECT ANSWER: ..." explanation
                 # - Incorrect options: shows error-type rationale
                 rat = item["Distractor_Rationales"].get(f"rationale_{letter.lower()}", "")
-                combined_opt_text = f"{opt_val}\n{rat}" if rat else opt_val
 
                 set_cell_text(t12.rows[r_idx].cells[0], letter, bold=True)
                 set_cell_text(t12.rows[r_idx].cells[1], is_correct)
-                set_cell_text(t12.rows[r_idx].cells[2], combined_opt_text)
+                set_cell_text(t12.rows[r_idx].cells[2], opt_val)
+                set_cell_text(t12.rows[r_idx].cells[3], rat)
         else:
             # Render empty MCQ table for non-MCQ
             for r_idx, letter in enumerate(["A", "B", "C", "D"], start=1):
                 set_cell_text(t12.rows[r_idx].cells[0], letter, bold=True)
                 set_cell_text(t12.rows[r_idx].cells[1], "")
                 set_cell_text(t12.rows[r_idx].cells[2], "")
+                set_cell_text(t12.rows[r_idx].cells[3], "")
                 
         # Subsection Header
         add_section_header(doc, "B4.  Correct Answer / Expected Response *")
@@ -1977,24 +2383,47 @@ def run_pipeline(excel_file, api_key: str, batch_meta: dict, progress_callback, 
         
         if item["Item_Type"] == "MCQ" or num_rubric_rows == 1:
             # MCQ requires 3 blank rows under the header row (4 rows total)
-            t16 = create_styled_table(doc, 4, [838, 1562, 6960], border_color="999999")
+            t16 = create_styled_table(doc, 4, [838, 1562, 3480, 3480], border_color="999999")
             set_cell_text(t16.rows[0].cells[0], "Score", bold=True)
             set_cell_text(t16.rows[0].cells[1], "Label", bold=True)
-            set_cell_text(t16.rows[0].cells[2], "Criteria — what must be present for this score + sample response", bold=True)
+            set_cell_text(t16.rows[0].cells[2], "Criteria — What must be present for this score", bold=True)
+            set_cell_text(t16.rows[0].cells[3], "Sample Response", bold=True)
+            
             for r_idx in range(1, 4):
                 set_cell_text(t16.rows[r_idx].cells[0], "")
                 set_cell_text(t16.rows[r_idx].cells[1], "")
                 set_cell_text(t16.rows[r_idx].cells[2], "")
+                set_cell_text(t16.rows[r_idx].cells[3], "")
         else:
-            t16 = create_styled_table(doc, num_rubric_rows, [838, 1562, 6960], border_color="999999")
+            t16 = create_styled_table(doc, num_rubric_rows, [838, 1562, 3480, 3480], border_color="999999")
             set_cell_text(t16.rows[0].cells[0], "Score", bold=True)
             set_cell_text(t16.rows[0].cells[1], "Label", bold=True)
-            set_cell_text(t16.rows[0].cells[2], "Criteria — what must be present for this score + sample response", bold=True)
+            set_cell_text(t16.rows[0].cells[2], "Criteria — What must be present for this score", bold=True)
+            set_cell_text(t16.rows[0].cells[3], "Sample Response", bold=True)
             for r_idx, r_val in enumerate(rubric_rows_data, start=1):
-                criteria_combined = f"Criteria: {r_val['criteria']}\nSample Response: {r_val['sample']}"
+                raw_criteria = r_val.get('criteria', '')
+                raw_sample = r_val.get('sample', '')
+                
+                # If sample is empty, check if we can extract it from criteria
+                if not raw_sample and raw_criteria:
+                    criteria_text, sample_text = split_criteria_and_sample(raw_criteria)
+                else:
+                    # Clean up prefixes from criteria and sample
+                    criteria_text = raw_criteria
+                    sample_text = raw_sample
+                    
+                    # Clean up "Criteria:" prefix from criteria_text if present
+                    criteria_pattern = re.compile(r'^(?:criteria\s*:|criteria\s*–|criteria\s*-|criteria\s*—)\s*', re.IGNORECASE)
+                    criteria_text = criteria_pattern.sub("", criteria_text).strip()
+                    
+                    # Clean up "Sample Response:" prefix from sample_text if present
+                    sample_pattern = re.compile(r'^(?:sample\s+response|sample\s+answer|sample)\s*[:–\-—]\s*', re.IGNORECASE)
+                    sample_text = sample_pattern.sub("", sample_text).strip()
+                
                 set_cell_text(t16.rows[r_idx].cells[0], str(r_val["score"]))
                 set_cell_text(t16.rows[r_idx].cells[1], r_val["label"])
-                set_cell_text(t16.rows[r_idx].cells[2], criteria_combined)
+                set_cell_text(t16.rows[r_idx].cells[2], f"Criteria: {criteria_text}" if criteria_text else "Criteria:")
+                set_cell_text(t16.rows[r_idx].cells[3], f"Sample response: {sample_text}" if sample_text else "Sample response:")
                 
         # Subsection Header
         add_section_header(doc, "B7.  Reviewer Notes  ", "(internal — not shown to learner)")
